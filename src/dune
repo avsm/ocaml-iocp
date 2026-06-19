@@ -1,7 +1,9 @@
 (library
  (name iocp)
  (public_name iocp)
- (libraries unix cstruct optint threads)
+ (libraries unix cstruct optint)
+ (library_flags :standard -cclib -lws2_32)
+ (c_library_flags :standard -lws2_32)
  (foreign_stubs
   (language c)
   (names iocp_stubs)))

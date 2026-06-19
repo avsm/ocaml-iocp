@@ -2,7 +2,8 @@ type t
 (* A handle to an I/O completion port *)
 
 type id = int
-(* An identifier associated with a Handle *)
+(* A completion key: an arbitrary int the caller associates with a handle/port
+   registration; echoed back in [completion_status.handle_id]. *)
 
 (* Completion Port Management *)
 external create_io_completion_port : int -> t
@@ -35,8 +36,6 @@ type completion_status = private
 external get_queued_completion_status : t -> int -> completion_status
   = "ocaml_iocp_get_queued_completion_status"
 
-external peek : t -> completion_status = "ocaml_iocp_peek"
-
 type unsafe_completion_status = {
   mutable handle_id : id;
   mutable bytes_transferred : int;
@@ -58,27 +57,61 @@ let make_unsafe_completion_status () =
     err = 0;
   }
 
-(* Operations *)
+(* Operations. The handle is already associated with a completion port, so these
+   don't take the port — completions are delivered to the associated port. *)
 external read :
-  t -> Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> unit
-  = "ocaml_iocp_read_bytes" "ocaml_iocp_read"
+  Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> unit
+  = "ocaml_iocp_read"
 
 external write :
-  t -> Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> unit
-  = "ocaml_iocp_write_bytes" "ocaml_iocp_write"
+  Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> unit
+  = "ocaml_iocp_write"
 
 external accept :
   Handle.t -> Handle.t  -> Cstruct.buffer -> 'a Overlapped.t -> unit
   = "ocaml_iocp_accept"
 
 external connect :
-  t -> Handle.t -> Sockaddr.t -> 'a Overlapped.t -> unit
+  Handle.t -> Sockaddr.t -> 'a Overlapped.t -> unit
   = "ocaml_iocp_connect"
 
-external send : t -> Handle.t -> Wsabuf.t -> 'a Overlapped.t -> unit
+external send : Handle.t -> Wsabuf.t -> 'a Overlapped.t -> unit
   = "ocaml_iocp_send"
 
-external recv : t -> Handle.t -> Wsabuf.t  -> 'a Overlapped.t -> unit
+external recv : Handle.t -> Wsabuf.t  -> 'a Overlapped.t -> unit
   = "ocaml_iocp_recv"
 
 external cancel : Handle.t -> 'a Overlapped.t -> unit = "ocaml_iocp_cancel"
+
+(* Cancel all outstanding overlapped operations on a handle (CancelIoEx with a
+   NULL overlapped). Each still produces an ERROR_OPERATION_ABORTED completion. *)
+external cancel_all : Handle.t -> unit = "ocaml_iocp_cancel_all"
+
+(* Datagram operations carrying a peer address. *)
+external recv_from :
+  Handle.t -> Wsabuf.t -> Sockaddr.t -> 'a Overlapped.t -> unit
+  = "ocaml_iocp_recv_from"
+
+external send_to :
+  Handle.t -> Wsabuf.t -> Sockaddr.t -> 'a Overlapped.t -> unit
+  = "ocaml_iocp_send_to"
+
+(* Post a key-only completion packet (no OVERLAPPED); used for wakeups and to
+   deliver the result of a [register_wait]. Safe to call from any thread. *)
+external post : t -> int -> int -> unit = "ocaml_iocp_post"
+
+(* Bridge a waitable HANDLE to the port: when [handle] is signalled, a packet
+   carrying [key] is posted. Returns an opaque token for [unregister_wait]. *)
+external register_wait : t -> Unix.file_descr -> int -> nativeint
+  = "ocaml_iocp_register_wait"
+
+external unregister_wait : nativeint -> unit = "ocaml_iocp_unregister_wait"
+
+(* Apply the socket context updates Winsock needs after AcceptEx/ConnectEx so
+   the accepted/connected socket is usable with getpeername/shutdown/etc. *)
+(* [update_accept_ctx accept listen] — the accepted socket and the listening
+   socket it came from. *)
+external update_accept_ctx : Handle.t -> Handle.t -> unit = "ocaml_iocp_update_accept_ctx"
+external update_connect_ctx : Handle.t -> unit = "ocaml_iocp_update_connect_ctx"
+
+external shutdown : Handle.t -> Unix.shutdown_command -> unit = "ocaml_iocp_shutdown"

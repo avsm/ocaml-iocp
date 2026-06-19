@@ -25,7 +25,7 @@ let copy_file block_size queue_depth infile outfile =
     if Optint.Int63.compare next_read_off st_size < 0 && num_in_flight < queue_depth then begin
       let buf = Cstruct.(to_bigarray @@ create block_size) in
       (* Printf.fprintf stderr "initial submit off=%d in_flight_requests = %d\n" (Optint.Int63.to_int next_read_off) num_in_flight; *)
-      let id = IM.read iocp fd buf ~pos:0 ~off:next_read_off ~len:block_size in
+      let id = Option.get (IM.read iocp fd buf ~pos:0 ~off:next_read_off ~len:block_size) in
       IM.H.replace in_progress_requests id {
         buf = buf;
         off = next_read_off;
@@ -38,22 +38,22 @@ let copy_file block_size queue_depth infile outfile =
   let rec handle_completion next_read_off num_in_flight =
     (* Printf.fprintf stderr "waiting for %d\n" num_in_flight; *)
     if num_in_flight > 0 then begin
-      match IM.completion_status iocp ~timeout:1000 with
-      | None -> assert false (* TODO: should we wait forever? *)
-      | Some t ->
+      match IM.wait iocp ~timeout:1000 with
+      | None | Some (IM.Posted _) -> assert false (* TODO: should we wait forever? *)
+      | Some (IM.Io t) ->
         let request = IM.H.find in_progress_requests t.id in
         IM.H.remove in_progress_requests t.id;
         begin match request.req with
         | `R ->
           (* Printf.fprintf stderr "read completed at %d\n" (Optint.Int63.to_int request.off); *)
-          let id = IM.write iocp out request.buf ~pos:0 ~off:request.off ~len:t.bytes_transferred in
+          let id = Option.get (IM.write iocp out request.buf ~pos:0 ~off:request.off ~len:t.bytes_transferred) in
           IM.H.replace in_progress_requests id { request with req = `W };
           handle_completion next_read_off num_in_flight
         | `W ->
           (* Printf.fprintf stderr "write completed at %d\n" (Optint.Int63.to_int request.off); *)
           if Optint.Int63.compare next_read_off st_size < 0 then begin
             let buf = Cstruct.(to_bigarray @@ create block_size) in
-            let id = IM.read iocp fd buf ~pos:0 ~off:next_read_off ~len:block_size in
+            let id = Option.get (IM.read iocp fd buf ~pos:0 ~off:next_read_off ~len:block_size) in
             IM.H.replace in_progress_requests id {
               buf = buf;
               off = next_read_off;

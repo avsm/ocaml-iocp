@@ -1,5 +1,5 @@
 (*
- * Copyright (C) 2020-2021 Anil Madhavapeddy
+ * Copyright (C) 2020-2026 Anil Madhavapeddy
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,8 +17,22 @@
 (* Borrowed from the IO_URING bindings *)
 
 type t
-(** Holder for the peer's address in {!accept}. *)
+(** A socket address, stored off the OCaml heap so it can be filled in by an
+    asynchronous operation. *)
 
 val of_unix : Unix.sockaddr -> t
 val create : unit -> t
 val get : t -> Unix.sockaddr
+
+(** {2 AcceptEx address buffer}
+
+    AcceptEx requires a caller-provided buffer to receive the new connection's
+    local and remote addresses. *)
+
+val accept_buffer : unit -> Cstruct.t
+(** A correctly-sized scratch buffer to pass to {!Iocp.accept}. Keep it alive
+    until the accept completes, then recover the peer with {!of_accept_buffer}. *)
+
+val of_accept_buffer : Cstruct.t -> listen:Handle.t -> t
+(** [of_accept_buffer buf ~listen] extracts the peer address AcceptEx wrote into
+    [buf]. [listen] is the listening socket the connection was accepted on. *)

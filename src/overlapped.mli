@@ -11,9 +11,12 @@ type 'a t
 type offset := Optint.Int63.t
 
 val create : ?off:offset -> 'a -> 'a t
-(** [create ~off key] A key is associated with the value at creation time, with the
-    condition that the value is an immediate rather than a block. This key can be
-    recovered via the [unsafe_key] function. *)
+(** [create ?off key] allocates an OVERLAPPED with initial offset [off] (default
+    offset 0). The offset is per-submission: {!Iocp} resets it before each pooled
+    operation, so [?off] matters only to direct {!Raw} users. A key is associated
+    with the value at creation time, with the condition that the value is an
+    immediate rather than a block. This key can be recovered via the [unsafe_key]
+    function. *)
 
 external set_offset : 'a t -> offset -> unit = "ocaml_iocp_set_overlapped_off"
 (** Set the offset associated with an OVERLAPPED. This offset is used in some IO
@@ -22,14 +25,16 @@ external set_offset : 'a t -> offset -> unit = "ocaml_iocp_set_overlapped_off"
 external set_key : 'a t -> 'a -> unit = "ocaml_iocp_set_overlapped_key"
 (** Sets the key *)
 
-val get_key : 'a t -> 'a
-(** Gets the key *)
+external reset : 'a t -> unit = "ocaml_iocp_reset_overlapped"
+(** [reset t] zeroes the OVERLAPPED body (preserving the key), clearing any state
+    left by a previous operation when the structure is drawn again from the pool. *)
 
 val id : 'a t -> int
-(** [id v] returns the id of v. The id is an integer that uniquely specifies the
-    OVERLAPPED structure and is returned in the {Iocp.Raw.completion_status}
-    type. *)
+(** [id v] returns the id of [v]. The id is an integer that uniquely specifies the
+    OVERLAPPED structure and is reported in the [overlapped_id] field of
+    {!Iocp.Raw.completion_status}. *)
 
 val unsafe_key : int -> 'a
-(** [unsafe_key i] returns the key associated with [v], where [i = id v].
-    Unsafe in that applying this function to an arbitrary integer may cause a crash. *)
+(** [unsafe_key i] returns the key of the OVERLAPPED whose id is [i] (i.e.
+    [i = id v] for some [v]). Unsafe in that applying this function to an
+    arbitrary integer may cause a crash. *)
