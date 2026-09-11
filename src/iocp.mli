@@ -27,6 +27,12 @@ val create : ?overlapped:int -> int -> t
     waiting threads. [overlapped] (default 1024) bounds the number of operations
     that may be in flight at once; submitting more returns [None] (see below). *)
 
+val close : t -> unit
+(** [close t] cancels everything still in flight, reaps the aborted completions
+    and closes the port. Idempotent, and also run from a finaliser, but worth
+    calling explicitly: the port's handle is held until it is, so a program that
+    creates ports over its lifetime otherwise accumulates one handle per port. *)
+
 val handle_of_fd : t -> Unix.file_descr -> int -> fd
 (** Associate an already-overlapped OS handle with the port under completion
     key [key]. *)

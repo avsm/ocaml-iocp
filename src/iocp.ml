@@ -35,6 +35,7 @@ type t = {
   mutable next_id : int;
   in_flight : (Handle.t * int Overlapped.t * roots) H.t;
   mutable free : int Overlapped.t list;
+  mutable closed : bool;
 }
 
 type completion_status = {
@@ -156,7 +157,9 @@ let shutdown _v fd cmd = Raw.shutdown fd cmd
 let update_accept_ctx _v ~listen accept = Raw.update_accept_ctx accept listen
 let update_connect_ctx _v fd = Raw.update_connect_ctx fd
 
-let finaliser v =
+(* Cancel everything still in flight and reap the aborted completions, so the
+   kernel is no longer writing into any of the buffers we were keeping alive. *)
+let drain v =
   H.iter (fun _ (fd, ol, _) -> Raw.cancel fd ol) v.in_flight;
   let rec loop () =
     if H.length v.in_flight = 0 then ()
@@ -166,14 +169,22 @@ let finaliser v =
   in
   loop ()
 
+let close v =
+  if not v.closed then begin
+    v.closed <- true;
+    drain v;
+    Raw.close_io_completion_port v.iocp
+  end
+
 let create ?(overlapped = 1024) n =
   let v =
     { iocp = Raw.create_io_completion_port n
     ; next_id = 1
     ; in_flight = H.create 255
-    ; free = List.init overlapped (fun _ -> Overlapped.create 0) }
+    ; free = List.init overlapped (fun _ -> Overlapped.create 0)
+    ; closed = false }
   in
-  Gc.finalise finaliser v;
+  Gc.finalise close v;
   v
 
 (*---------------------------------------------------------------------------

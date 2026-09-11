@@ -8,6 +8,9 @@ type id = int
 external create_io_completion_port : int -> t
   = "ocaml_iocp_create_io_completion_port"
 
+external close_io_completion_port : t -> unit
+  = "ocaml_iocp_close_io_completion_port"
+
 (* File descriptors must be associated with an IOCP before we do any IO on them *)
 external associate_fd_with_iocp : t -> Unix.file_descr -> id -> Handle.t
   = "ocaml_iocp_associate_fd_with_iocp"

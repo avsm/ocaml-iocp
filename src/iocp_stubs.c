@@ -200,6 +200,19 @@ value ocaml_iocp_create_io_completion_port(value v_threads) {
     CAMLreturn(win_alloc_handle(cp));
 }
 
+/* Close the port handle. win_alloc_handle does not close on collection, so
+   without this a port's handle is held until the process exits. */
+value ocaml_iocp_close_io_completion_port(value v_iocp) {
+    CAMLparam1(v_iocp);
+
+    if (!CloseHandle(Handle_val(v_iocp))) {
+      win32_maperr(GetLastError());
+      uerror("CloseHandle", Nothing);
+    }
+
+    CAMLreturn(Val_unit);
+}
+
 value ocaml_iocp_associate_fd_with_iocp(value v_iocp, value v_fd, value v_key) {
     CAMLparam3(v_iocp, v_fd, v_key);
 
