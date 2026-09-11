@@ -311,11 +311,27 @@ void ocaml_iocp_get_queued_completion_status_unsafe(value v_fd, value v_timeout,
     CAMLreturn0;
 }
 
+/* The kernel writes into the buffer long after the call returns, so a length
+   that runs off the end of it corrupts the heap rather than failing. Check
+   before submitting. Written as [pos > dim - len] so it stays correct when
+   [len] is larger than the whole buffer. */
+static void check_bounds(value v_ba, value v_pos, value v_len, const char *op)
+{
+    intnat dim = Caml_ba_array_val(v_ba)->dim[0];
+    intnat pos = Long_val(v_pos);
+    intnat len = Long_val(v_len);
+    if (pos < 0 || len < 0 || pos > dim - len)
+      caml_invalid_argument(op);
+}
+
 value ocaml_iocp_read(value v_fd, value v_ba, value v_num_bytes, value v_off, value v_overlapped) {
     CAMLparam3(v_fd, v_ba, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
-    void *buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
-    BOOL b = ReadFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
+    void *buf;
+    BOOL b;
+    check_bounds(v_ba, v_off, v_num_bytes, "Iocp.read: buffer too small");
+    buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
+    b = ReadFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
     // FALSE with ERROR_IO_PENDING just means the op is running asynchronously.
     if (!b) {
       DWORD err = GetLastError();
@@ -329,8 +345,11 @@ value ocaml_iocp_read(value v_fd, value v_ba, value v_num_bytes, value v_off, va
 value ocaml_iocp_write(value v_fd, value v_ba, value v_num_bytes, value v_off, value v_overlapped) {
     CAMLparam3(v_fd, v_ba, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
-    void *buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
-    BOOL b = WriteFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
+    void *buf;
+    BOOL b;
+    check_bounds(v_ba, v_off, v_num_bytes, "Iocp.write: buffer too small");
+    buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
+    b = WriteFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
     if (!b) {
       DWORD err = GetLastError();
       if(err == ERROR_IO_PENDING) CAMLreturn(Val_unit);
@@ -354,9 +373,13 @@ static LPFN_GETACCEPTEXSOCKADDRS get_accept_ex_sockaddrs(SOCKET s) {
     return fn;
 }
 
+/* AcceptEx is told the buffer holds a local and a remote address, so it must
+   actually be that big or the kernel writes past the end of it. */
+#define ACCEPT_BUFFER_SIZE (2 * (sizeof(union sock_addr_union) + 16))
+
 value ocaml_iocp_accept_buffer_size(value v_unit) {
     CAMLparam1(v_unit);
-    CAMLreturn(Val_int(2 * (sizeof(union sock_addr_union) + 16)));
+    CAMLreturn(Val_int(ACCEPT_BUFFER_SIZE));
 }
 
 value ocaml_iocp_get_accept_ex_sockaddr(value v_accept_buffer, value v_listen, value v_sockaddr) {
@@ -371,6 +394,9 @@ value ocaml_iocp_get_accept_ex_sockaddr(value v_accept_buffer, value v_listen, v
         win32_maperr(WSAGetLastError());
         uerror("WSAIoctl", Nothing);
     }
+
+    if ((uintnat)Caml_ba_array_val(v_accept_buffer)->dim[0] < ACCEPT_BUFFER_SIZE)
+      caml_invalid_argument("Iocp.Sockaddr.of_accept_buffer: buffer too small");
 
     lpfnGetAcceptExSockaddrs(
         Caml_ba_data_val(v_accept_buffer),
@@ -412,6 +438,9 @@ void ocaml_iocp_accept(value v_listen, value v_accept, value v_accept_buffer, va
       win32_maperr(WSAGetLastError());
       uerror("WSAIoctl", Nothing);
     }
+
+    if ((uintnat)Caml_ba_array_val(v_accept_buffer)->dim[0] < ACCEPT_BUFFER_SIZE)
+      caml_invalid_argument("Iocp.accept: buffer smaller than Sockaddr.accept_buffer_size");
 
     BOOL b = lpfnAcceptEx(
         Socket_val(v_listen),               // The listening socket
