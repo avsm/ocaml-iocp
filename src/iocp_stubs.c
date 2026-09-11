@@ -614,6 +614,22 @@ value ocaml_iocp_cancel(value v_fd, value v_overlapped) {
   CAMLreturn(Val_unit);
 }
 
+value ocaml_iocp_cancel_all(value v_fd) {
+  CAMLparam1(v_fd);
+
+  /* Cancel every outstanding overlapped operation on this handle (CancelIoEx with
+     a NULL overlapped). Each still posts an ERROR_OPERATION_ABORTED completion the
+     caller must drain; ERROR_NOT_FOUND just means nothing was pending. */
+  if (!CancelIoEx(Handle_val(v_fd), NULL)) {
+    DWORD err = GetLastError();
+    if (err != ERROR_NOT_FOUND) {
+      win32_maperr(err);
+      uerror("CancelIoEx", Nothing);
+    }
+  }
+  CAMLreturn(Val_unit);
+}
+
 value ocaml_iocp_post(value v_iocp, value v_key, value v_bytes) {
   CAMLparam3(v_iocp, v_key, v_bytes);
   BOOL b = PostQueuedCompletionStatus(Handle_val(v_iocp),

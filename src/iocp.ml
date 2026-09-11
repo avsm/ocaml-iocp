@@ -108,6 +108,8 @@ let cancel v id =
   | Some (fd, ol, _) -> Raw.cancel fd ol
   | None -> ()
 
+let cancel_all _v fd = Raw.cancel_all fd
+
 let accept v sock sock_accept addr_buf =
   let buf = Cstruct.to_bigarray addr_buf in
   match get_overlapped v sock (ReadWrite buf) with

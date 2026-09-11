@@ -82,6 +82,10 @@ external recv : Handle.t -> Wsabuf.t  -> 'a Overlapped.t -> unit
 
 external cancel : Handle.t -> 'a Overlapped.t -> unit = "ocaml_iocp_cancel"
 
+(* Cancel all outstanding overlapped operations on a handle (CancelIoEx with a
+   NULL overlapped). Each still produces an ERROR_OPERATION_ABORTED completion. *)
+external cancel_all : Handle.t -> unit = "ocaml_iocp_cancel_all"
+
 (* Datagram operations carrying a peer address. *)
 external recv_from :
   Handle.t -> Wsabuf.t -> Sockaddr.t -> 'a Overlapped.t -> unit

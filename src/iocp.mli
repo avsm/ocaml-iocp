@@ -68,6 +68,12 @@ val cancel : t -> Id.t -> unit
     The operation still produces a completion which must be reaped with {!completion_status}.
     Cancelling an unknown/already-completed id is a no-op. *)
 
+val cancel_all : t -> fd -> unit
+(** [cancel_all t fd] cancels every outstanding overlapped operation on [fd] (via
+    [CancelIoEx] with a NULL overlapped). Each cancelled operation still produces
+    an [ERROR_OPERATION_ABORTED] completion to be reaped with {!wait}. Useful to
+    unblock a pending recv when shutting down a socket's receive side. *)
+
 val active_ops : t -> int
 (** Number of operations submitted but not yet reaped (including cancelled ones
     whose aborted completion has not yet been drained). *)
