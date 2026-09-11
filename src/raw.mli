@@ -3,6 +3,9 @@ type id = int
 
 val create_io_completion_port : int -> t
 
+external close_io_completion_port : t -> unit
+  = "ocaml_iocp_close_io_completion_port"
+
 external associate_fd_with_iocp : t -> Unix.file_descr -> id -> Handle.t
   = "ocaml_iocp_associate_fd_with_iocp"
 
