@@ -18,6 +18,16 @@
  (modules t1)
  (libraries iocp alcotest threads))
 
+(executable
+ (name test_iocp)
+ (modules test_iocp)
+ (libraries iocp alcotest unix))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_iocp.exe)))
+
 (rule
  (alias runtest)
  (deps ./test.md)

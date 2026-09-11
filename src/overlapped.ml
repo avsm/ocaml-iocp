@@ -12,10 +12,8 @@ external set_key : 'a t -> 'a -> unit = "ocaml_iocp_set_overlapped_key"
 
 let create ?(off = Optint.Int63.zero) key =
   let v = alloc key in
-  (* let id = v.id in *)
   set_offset v off;
-  (* Format.printf "Allocated overlapped: %d\n%!" id; *)
-  Gc.finalise (fun v -> (*Format.printf "Freeing overlapped: %d\n%!" id; *) free v) v;
+  Gc.finalise free v;
   v
 
 let id t = t.id

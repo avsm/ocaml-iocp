@@ -20,7 +20,7 @@ let listen () =
   let iocp = Iocp.Raw.create_io_completion_port 5 in
   let sock, sock_accept = listening_sock iocp in
   Format.eprintf "Got an accepting socket\n%!";
-  let addr_buf = Iocp.Accept_buffer.create () in
+  let addr_buf = Iocp.Sockaddr.accept_buffer () in
   let ol = Iocp.Overlapped.create 1024 in
   let ol_id = Iocp.Overlapped.id ol in
 
@@ -32,11 +32,11 @@ let listen () =
   | Cs_some t ->
     assert (t.overlapped_id = ol_id);
     assert (Iocp.Overlapped.unsafe_key t.overlapped_id = 1024);
-    let client_addr = Iocp.Accept_buffer.get_remote addr_buf sock in
+    let client_addr = Iocp.Sockaddr.of_accept_buffer addr_buf ~listen:sock in
     print_sockaddr @@ Iocp.Sockaddr.get client_addr;
     let buf = Cstruct.create 4096 in
     let wsabuf = Iocp.Wsabuf.create [buf] in
-    Iocp.Raw.recv iocp sock_accept wsabuf ol;
+    Iocp.Raw.recv sock_accept wsabuf ol;
     match Iocp.Raw.get_queued_completion_status iocp 1000 with
     | Cs_none -> assert false
     | Cs_some t ->
@@ -52,7 +52,7 @@ let connect () =
   let ol = Iocp.Overlapped.create 1025 in
   let ol_id = Iocp.Overlapped.id ol in
 
-  let () = Iocp.Raw.connect iocp sock (Iocp.Sockaddr.of_unix addr) ol in
+  let () = Iocp.Raw.connect sock (Iocp.Sockaddr.of_unix addr) ol in
   match Iocp.Raw.get_queued_completion_status iocp 1000 with
   | Cs_none -> assert false
   | Cs_some t ->
@@ -62,7 +62,7 @@ let connect () =
     print_endline "Connected! Now sending data...";
     let buf = Cstruct.of_string "Hello socket!" in
     let wsabuf = Iocp.Wsabuf.create [buf] in
-    Iocp.Raw.send iocp sock wsabuf ol ;
+    Iocp.Raw.send sock wsabuf ol ;
     (* Gc.full_major (); *)
     print_endline "Data queued up...";
     match Iocp.Raw.get_queued_completion_status iocp 1000 with

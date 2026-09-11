@@ -8,7 +8,7 @@ let pipe () =
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let ol_id = Iocp.Overlapped.id ol in
   let () =
-    Iocp.Raw.write iocp wfd (Cstruct.to_bigarray buf) (String.length s) 0 ol
+    Iocp.Raw.write wfd (Cstruct.to_bigarray buf) (String.length s) 0 ol
   in
   match Iocp.Raw.get_queued_completion_status iocp 1000 with
   | Cs_none -> assert false
@@ -18,7 +18,7 @@ let pipe () =
       assert (ol_id = ol_id');
       let buf' = Cstruct.create t.bytes_transferred in
       let () =
-        Iocp.Raw.read iocp rfd (Cstruct.to_bigarray buf') t.bytes_transferred 0
+        Iocp.Raw.read rfd (Cstruct.to_bigarray buf') t.bytes_transferred 0
           ol
       in
       match Iocp.Raw.get_queued_completion_status iocp 1000 with
@@ -37,7 +37,7 @@ let cancel () =
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let ol_id = Iocp.Overlapped.id ol in
   let () =
-    Iocp.Raw.read iocp rfd (Cstruct.to_bigarray buf') 100 0
+    Iocp.Raw.read rfd (Cstruct.to_bigarray buf') 100 0
       ol
   in
   match Iocp.Raw.get_queued_completion_status iocp 100 with
@@ -60,7 +60,7 @@ let write_read () =
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let buf = Cstruct.of_string "Test data" in
   let () =
-    Iocp.Raw.write iocp handle (Cstruct.to_bigarray buf) (Cstruct.length buf) 0
+    Iocp.Raw.write handle (Cstruct.to_bigarray buf) (Cstruct.length buf) 0
       ol
   in
   (match Iocp.Raw.get_queued_completion_status iocp 1000 with
@@ -69,7 +69,7 @@ let write_read () =
   let buf2 = Cstruct.create (Cstruct.length buf) in
   let ol2 = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let () =
-    Iocp.Raw.read iocp handle (Cstruct.to_bigarray buf2) (Cstruct.length buf) 0
+    Iocp.Raw.read handle (Cstruct.to_bigarray buf2) (Cstruct.length buf) 0
       ol2
   in
   (match Iocp.Raw.get_queued_completion_status iocp 1000 with
@@ -123,14 +123,14 @@ let multicore_read max () =
         (ol, write_buf))
   in
   let dispatch_write (ol, buf) =
-    Iocp.Raw.write iocp wfd (Cstruct.to_bigarray buf) (String.length s) 0 ol
+    Iocp.Raw.write wfd (Cstruct.to_bigarray buf) (String.length s) 0 ol
   in
   let dispatch_reads n =
     List.init n (fun _ ->
         let read_buf = Cstruct.create (String.length s) in
         let ol = Iocp.Overlapped.create () in
         let () =
-          Iocp.Raw.read iocp rfd
+          Iocp.Raw.read rfd
             (Cstruct.to_bigarray read_buf)
             (String.length s) 0 ol
         in
@@ -196,14 +196,14 @@ let multicore_read_unsafe () =
         (ol, write_buf))
   in
   let dispatch_write (ol, buf) =
-    Iocp.Raw.write iocp wfd (Cstruct.to_bigarray buf) (String.length s) 0 ol
+    Iocp.Raw.write wfd (Cstruct.to_bigarray buf) (String.length s) 0 ol
   in
   let dispatch_reads n =
     List.init n (fun _ ->
         let read_buf = Cstruct.create (String.length s) in
         let ol = Iocp.Overlapped.create () in
         let () =
-          Iocp.Raw.read iocp rfd
+          Iocp.Raw.read rfd
             (Cstruct.to_bigarray read_buf)
             (String.length s) 0 ol
         in
@@ -264,62 +264,15 @@ let error_out_of_bounds () =
   let handle = Iocp.Raw.openfile iocp 1 filename Unix.[ O_RDONLY ] 0 in
   let buf = Cstruct.create 1 in
   let ol = Iocp.Overlapped.create ~off:(Optint.Int63.of_int 1024) () in
-  let () = Iocp.Raw.read iocp handle (Cstruct.to_bigarray buf) 1 0 ol in
+  let () = Iocp.Raw.read handle (Cstruct.to_bigarray buf) 1 0 ol in
   match Iocp.Raw.get_queued_completion_status iocp 1000 with
   | Cs_none -> assert false
   | Cs_some t -> ( match t.error with None -> assert false | Some _e -> ())
 
 
-let safest () =
-  let iocp = Iocp.create 10 in
-  let filename = "test_file_3.txt" in
-  let handle =
-    Iocp.openfile iocp 1 filename Unix.[ O_CREAT; O_RDWR; O_TRUNC ] 0o600
-  in
-  let buf = Cstruct.of_string "Test data" in
-  let write_id =
-    IM.write iocp handle (Cstruct.to_bigarray buf) ~pos:0 ~len:(Cstruct.length buf) ~off:(Optint.Int63.zero)
-  in
-  (match IM.completion_status iocp ~timeout:1000 with
-  | None -> assert false
-  | Some cs -> Format.printf "%d %d\n" (Iocp.Id.to_int cs.IM.id) (Iocp.Id.to_int write_id);  Alcotest.(check int) "write_id matches" (Iocp.Id.to_int cs.IM.id) (Iocp.Id.to_int write_id));
-
-  let buf2 = Cstruct.create (Cstruct.length buf) in
-  let read_id =
-    IM.read iocp handle (Cstruct.to_bigarray buf2) ~pos:0 ~len:(Cstruct.length buf) ~off:(Optint.Int63.zero)
-  in
-  (match IM.completion_status iocp ~timeout:1000 with
-  | None -> assert false
-  | Some cs ->
-    Format.printf "%d %d\n" (Iocp.Id.to_int cs.IM.id) (Iocp.Id.to_int read_id);
-    Format.printf "bytes transferred: %d\n" cs.bytes_transferred;
-    Format.printf "error = %s\n" (match cs.error with | None -> "None" | Some e -> Unix.error_message e);
-    Alcotest.(check int) "read_id matches" (Iocp.Id.to_int cs.IM.id) (Iocp.Id.to_int read_id));
-  Format.eprintf "buf='%s' buf2='%s'\n%!" (Cstruct.to_string buf) (Cstruct.to_string buf2);
-  assert (Cstruct.equal buf buf2)
-
-
-  let listening_sock iocp =
-    let addr = Unix.(ADDR_INET (Unix.inet_addr_loopback, 8889)) in
-    let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-    Unix.bind sock addr;
-    Unix.listen sock 0;
-    let sock_accept = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-    Unix.setsockopt sock SO_REUSEADDR true;
-    IM.handle_of_fd iocp sock 1, IM.handle_of_fd iocp sock_accept 2
-  
-  let listen () =
-    let iocp = IM.create 5 in
-    let sock, sock_accept = listening_sock iocp in
-    Format.eprintf "Got an accepting socket\n%!";
-    let addr_buf = Iocp.Accept_buffer.create () in
-    let id = IM.accept iocp sock sock_accept addr_buf in
-    id,iocp
-
-let gc_test () =
-  let _ = listen () in
-  Gc.full_major ();
-  ()
+(* The managed [Iocp] layer (file write/read, sockets, gc) is now covered by the
+   self-contained suite in test_iocp.ml, against the current option-returning /
+   [packet]-variant API. This file keeps the lower-level [Iocp.Raw] tests. *)
 
 let () =
   let open Alcotest in
@@ -331,7 +284,6 @@ let () =
           (* test_case "safest" `Quick safest; *)
           test_case "cancel" `Quick cancel;
           test_case "gc_before_more_tests" `Quick Gc.full_major;
-          test_case "gc" `Quick gc_test;
         ];
       "errors", [
         test_case "non_overlapped" `Quick error_non_overlapped;
