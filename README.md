@@ -2,33 +2,47 @@
 
 These are OCaml bindings for Windows' [input/output completion ports](https://docs.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports).
 
-The API is very similar to that of [ocaml-uring](https://github.com/ocaml-multicore/ocaml-uring) and in fact borrows the `Heap` implementation to pass integer ids to requests instead of the actual key data. 
+The API is modelled on [ocaml-uring](https://github.com/ocaml-multicore/ocaml-uring). Each
+asynchronous operation is submitted against a completion port and identified by an opaque
+`Iocp.Id.t`, and completions are reaped from the port and matched back to their submission.
 
 ## Usage
 
-To read a file, you first create a completion port, then open the file using the `Iocp.Handle` module. This ensures the file handle has `FILE_FLAG_OVERLAPPED` set. You can then perform the asynchronous read and wait on the completion port to return the result to you. By default, the completion status will wait indefinitely for a completion packet to arrive.
+Create a completion port, then open files with `Iocp.openfile` or associate an
+existing overlapped handle/socket with `Iocp.handle_of_fd`. Submitting an
+operation returns an `Iocp.Id.t option`; `None` is if the (bounded) operation
+pool is momentarily full. Reap completions with `Iocp.wait`, matching the
+returned `id` against the one you were given.
 
-This program copies a file.
+An operation still in flight can be cancelled with `Iocp.cancel`, or all of
+them on one handle with `Iocp.cancel_all`; either way each still reports a
+completion, which you must reap. Finish with `Iocp.close`, which cancels and
+drains whatever is left and releases the port's handle.
 
-<!-- $MDX file=test/copy.ml -->
+This program reads a block from one file and writes it to another (see `test/copy_lib.ml`
+for a full queued-depth file copy):
+
 ```ocaml
-type req = [ `R | `W ]
-
 let () =
-  let iocp = Iocp.create () in
-  let fd = Iocp.Handle.openfile Sys.argv.(1) [O_RDONLY] 0 in
-  let out = Iocp.Handle.openfile Sys.argv.(2) [O_WRONLY; O_CREAT; O_TRUNC] 0o644 in
-  let buf = Cstruct.create 1024 in
-  let _job = Iocp.read iocp ~file_offset:Optint.Int63.zero fd buf ~off:0 ~len:1024 `R in
-  match Iocp.get_queued_completion_status iocp with
-    | None -> assert false
-    | Some t ->
-      assert (t.data = `R);
-      let _job = Iocp.write iocp ~file_offset:Optint.Int63.zero out buf ~off:0 ~len:t.bytes_transferred `W in
-      match Iocp.get_queued_completion_status iocp with
-      | None -> assert false
-      | Some t ->
-        assert (t.data = `W);
-        Unix.close (fd :> Unix.file_descr);
-        Unix.close (out :> Unix.file_descr)
+  let iocp = Iocp.create 1 in
+  let src = Iocp.openfile iocp 1 Sys.argv.(1) [ O_RDONLY ] 0 in
+  let dst = Iocp.openfile iocp 2 Sys.argv.(2) [ O_WRONLY; O_CREAT; O_TRUNC ] 0o644 in
+  let buf = Cstruct.create 4096 in
+  let off = Optint.Int63.zero in
+  let read_id = Option.get (Iocp.read iocp src (Cstruct.to_bigarray buf) ~pos:0 ~len:4096 ~off) in
+  (match Iocp.wait iocp ~timeout:(-1) with
+   | Some (Iocp.Io { id; bytes_transferred; error = None }) ->
+     assert (Iocp.Id.equal id read_id);
+     let _ = Iocp.write iocp dst (Cstruct.to_bigarray buf) ~pos:0 ~len:bytes_transferred ~off in
+     ignore (Iocp.wait iocp ~timeout:(-1))
+   | _ -> assert false);
+  Unix.close (Iocp.Handle.fd src);
+  Unix.close (Iocp.Handle.fd dst);
+  Iocp.close iocp
 ```
+
+## Testing
+
+`dune runtest` runs the unit tests plus a stress suite (`test/stress.ml`) that
+puts a port through enough sustained work to catch a leak of either resource it
+owns — the pool of OVERLAPPEDs and the port handle itself.
