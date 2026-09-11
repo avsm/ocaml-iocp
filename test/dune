@@ -50,3 +50,16 @@
  (action
   (run ./cptest.exe)))
 
+
+(executable
+ (name stress)
+ (modules stress)
+ (libraries iocp alcotest unix)
+ (foreign_stubs
+  (language c)
+  (names stress_stubs)))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./stress.exe)))
