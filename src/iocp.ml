@@ -65,21 +65,34 @@ let get_overlapped v fd root =
     H.replace v.in_flight id (fd, ol, root);
     Some (ol, id)
 
-let read v fd buf ~pos ~len ~off =
-  match get_overlapped v fd (ReadWrite buf) with
+(* Hand an OVERLAPPED back to the pool. Only ever for an operation that did not
+   start: one that did is released by {!wait} when its completion arrives. *)
+let release v id =
+  match H.find_opt v.in_flight id with
+  | None -> ()
+  | Some (_, ol, _) -> H.remove v.in_flight id; v.free <- ol :: v.free
+
+(* Take a slot from the pool and start an operation on it. If [start] raises,
+   the operation never went pending, so no completion will ever arrive to
+   release the slot and it has to go back here — otherwise every synchronous
+   failure costs the port one OVERLAPPED for good. *)
+let submit v fd root start =
+  match get_overlapped v fd root with
   | None -> None
   | Some (ol, id) ->
-    Overlapped.set_offset ol off;
-    Raw.read fd buf len pos ol;
-    Some id
+    match start ol with
+    | () -> Some id
+    | exception ex -> release v id; raise ex
+
+let read v fd buf ~pos ~len ~off =
+  submit v fd (ReadWrite buf) (fun ol ->
+      Overlapped.set_offset ol off;
+      Raw.read fd buf len pos ol)
 
 let write v fd buf ~pos ~len ~off =
-  match get_overlapped v fd (ReadWrite buf) with
-  | None -> None
-  | Some (ol, id) ->
-    Overlapped.set_offset ol off;
-    Raw.write fd buf len pos ol;
-    Some id
+  submit v fd (ReadWrite buf) (fun ol ->
+      Overlapped.set_offset ol off;
+      Raw.write fd buf len pos ol)
 
 let wait v ~timeout =
   match Raw.get_queued_completion_status v.iocp timeout with
@@ -112,39 +125,27 @@ let cancel_all _v fd = Raw.cancel_all fd
 
 let accept v sock sock_accept addr_buf =
   let buf = Cstruct.to_bigarray addr_buf in
-  match get_overlapped v sock (ReadWrite buf) with
-  | None -> None
-  | Some (ol, id) -> Raw.accept sock sock_accept buf ol; Some id
+  submit v sock (ReadWrite buf) (fun ol -> Raw.accept sock sock_accept buf ol)
 
 let recv v sock bufs =
   let wsabuf = Wsabuf.create bufs in
-  match get_overlapped v sock (RecvSend wsabuf) with
-  | None -> None
-  | Some (ol, id) -> Raw.recv sock wsabuf ol; Some id
+  submit v sock (RecvSend wsabuf) (fun ol -> Raw.recv sock wsabuf ol)
 
 let send v sock bufs =
   let wsabuf = Wsabuf.create bufs in
-  match get_overlapped v sock (RecvSend wsabuf) with
-  | None -> None
-  | Some (ol, id) -> Raw.send sock wsabuf ol; Some id
+  submit v sock (RecvSend wsabuf) (fun ol -> Raw.send sock wsabuf ol)
 
 (* [addr] is filled in with the source on completion, so it must stay alive. *)
 let recv_from v sock bufs addr =
   let wsabuf = Wsabuf.create bufs in
-  match get_overlapped v sock (RecvSendAddr (wsabuf, addr)) with
-  | None -> None
-  | Some (ol, id) -> Raw.recv_from sock wsabuf addr ol; Some id
+  submit v sock (RecvSendAddr (wsabuf, addr)) (fun ol -> Raw.recv_from sock wsabuf addr ol)
 
 let send_to v sock bufs addr =
   let wsabuf = Wsabuf.create bufs in
-  match get_overlapped v sock (RecvSendAddr (wsabuf, addr)) with
-  | None -> None
-  | Some (ol, id) -> Raw.send_to sock wsabuf addr ol; Some id
+  submit v sock (RecvSendAddr (wsabuf, addr)) (fun ol -> Raw.send_to sock wsabuf addr ol)
 
 let connect v sock addr =
-  match get_overlapped v sock (Connect addr) with
-  | None -> None
-  | Some (ol, id) -> Raw.connect sock addr ol; Some id
+  submit v sock (Connect addr) (fun ol -> Raw.connect sock addr ol)
 
 (* Post a key-only packet to wake a thread in {!completion_status}. *)
 let post v ~key ~bytes = Raw.post v.iocp key bytes
