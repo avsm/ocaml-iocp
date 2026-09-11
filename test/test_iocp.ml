@@ -261,6 +261,49 @@ let register_wait_lifecycle () =
   Iocp.unregister_wait w;
   Iocp.unregister_wait w (* idempotent: must not double free *)
 
+
+(* {2 Argument checking}
+
+   The kernel touches these buffers after the call returns, so a length that
+   runs past the end of one corrupts the heap instead of failing. They have to
+   be rejected at submission. *)
+
+let rejects_oversized_read () =
+  let iocp = Iocp.create ~overlapped:4 1 in
+  Fun.protect ~finally:(fun () -> Iocp.close iocp) @@ fun () ->
+  let fn = Filename.temp_file "iocp_bounds" ".bin" in
+  Fun.protect ~finally:(fun () -> try Sys.remove fn with Sys_error _ -> ()) @@ fun () ->
+  let h = Iocp.openfile iocp 1 fn Unix.[ O_CREAT; O_RDWR; O_TRUNC ] 0o600 in
+  let small = Cstruct.to_bigarray (Cstruct.create 16) in
+  let bad op = Alcotest.check_raises op (Invalid_argument op) in
+  bad "Iocp.read: buffer too small"
+    (fun () -> ignore (Iocp.read iocp h small ~pos:0 ~len:4096 ~off:zero));
+  bad "Iocp.read: buffer too small"
+    (fun () -> ignore (Iocp.read iocp h small ~pos:8 ~len:16 ~off:zero));
+  bad "Iocp.write: buffer too small"
+    (fun () -> ignore (Iocp.write iocp h small ~pos:0 ~len:4096 ~off:zero));
+  (* A rejected submission must not keep the slot it drew from the pool. *)
+  Alcotest.(check int) "nothing in flight" 0 (Iocp.active_ops iocp);
+  let id = must "write" (Iocp.write iocp h small ~pos:0 ~len:16 ~off:zero) in
+  let cs = wait_io iocp in
+  check_no_error "write" cs;
+  Alcotest.(check bool) "pool still usable" true (Iocp.Id.equal cs.id id)
+
+let rejects_undersized_accept_buffer () =
+  let iocp = Iocp.create ~overlapped:4 1 in
+  Fun.protect ~finally:(fun () -> Iocp.close iocp) @@ fun () ->
+  let lfd_u = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let sock_u = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Fun.protect ~finally:(fun () -> close_noerr lfd_u; close_noerr sock_u) @@ fun () ->
+  Unix.bind lfd_u (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen lfd_u 1;
+  let lfd = Iocp.handle_of_fd iocp lfd_u 1 in
+  let sock = Iocp.handle_of_fd iocp sock_u 2 in
+  Alcotest.check_raises "too small"
+    (Invalid_argument "Iocp.accept: buffer smaller than Sockaddr.accept_buffer_size")
+    (fun () -> ignore (Iocp.accept iocp lfd sock (Cstruct.create 4)));
+  Alcotest.(check int) "nothing in flight" 0 (Iocp.active_ops iocp)
+
 let () =
   Alcotest.run "iocp"
     [ ( "file",
@@ -276,6 +319,9 @@ let () =
       ( "backpressure",
         [ Alcotest.test_case "pool_exhaustion_and_cancel" `Quick pool_exhaustion_and_cancel;
           Alcotest.test_case "cancel_reports_error" `Quick cancel_reports_error ] );
+      ( "arguments",
+        [ Alcotest.test_case "oversized read/write" `Quick rejects_oversized_read;
+          Alcotest.test_case "undersized accept buffer" `Quick rejects_undersized_accept_buffer ] );
       ( "wakeup",
         [ Alcotest.test_case "post" `Quick post_packet;
           Alcotest.test_case "wakeup" `Quick wakeup_packet;
