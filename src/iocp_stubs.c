@@ -233,11 +233,11 @@ value ocaml_iocp_associate_fd_with_iocp(value v_iocp, value v_fd, value v_key) {
 }
 value ocaml_iocp_get_queued_completion_status(value v_fd, value v_timeout) {
     CAMLparam2(v_fd, v_timeout);
-    CAMLlocal2(v,v_err);
+    CAMLlocal3(v,v_err,v_code);
     BOOL b = 0;
     HANDLE fd = Handle_val(v_fd);
     DWORD transferred = 0;
-    DWORD_PTR ptr;
+    DWORD_PTR ptr = 0;
     DWORD err;
     v_err = Val_int(0); /* None */
     LPOVERLAPPED ol = NULL;
@@ -263,12 +263,15 @@ value ocaml_iocp_get_queued_completion_status(value v_fd, value v_timeout) {
       uerror("QueuedCompletionStatus", Nothing);
     }
 
-    /* Indicates an error with the IO operation represented by ol */
+    /* Indicates an error with the IO operation represented by ol.
+       win32_maperr reports through the global errno, so translate it before
+       allocating: an allocation can collect, and a finaliser running there is
+       free to make a syscall of its own and overwrite errno. */
     if(!b && ol != NULL) {
-      /* Set the global var errno */
       win32_maperr(GetLastError ());
+      v_code = unix_error_of_code(errno);
       v_err = caml_alloc(1, 0);
-      Store_field(v_err, 0, unix_error_of_code(errno));
+      Store_field(v_err, 0, v_code);
     }
 
     v = caml_alloc(4, 0);
