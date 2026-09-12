@@ -63,16 +63,14 @@ struct sock_addr_data {
   socklen_param_type sock_addr_len;
 };
 
-#define Sock_addr_val(v) (*((struct sock_addr_data **) Data_custom_val(v)))
-
-static void finalize_sock_addr(value v) {
-  caml_stat_free(Sock_addr_val(v));
-  Sock_addr_val(v) = NULL;
-}
+/* The address lives in the custom block rather than behind a pointer to it: a
+   datagram receive makes one per call, so the malloc and its finaliser were
+   pure overhead. */
+#define Sock_addr_val(v) ((struct sock_addr_data *) Data_custom_val(v))
 
 static struct custom_operations sockaddr_ops = {
   "iocp.sockaddr",
-  finalize_sock_addr,
+  custom_finalize_default,
   custom_compare_default,
   custom_hash_default,
   custom_serialize_default,
@@ -85,13 +83,9 @@ value
 ocaml_iocp_make_sockaddr(value v_sockaddr) {
   CAMLparam1(v_sockaddr);
   CAMLlocal1(v);
-  struct sock_addr_data *data;
-  v = caml_alloc_custom_mem(&sockaddr_ops, sizeof(struct sock_addr_data *), sizeof(struct sock_addr_data));
-  Sock_addr_val(v) = NULL;
-  data = (struct sock_addr_data *) caml_stat_alloc(sizeof(struct sock_addr_data));
-  Sock_addr_val(v) = data;
-  // If this raises, the GC will free [v], which will free [data]:
-  get_sockaddr(v_sockaddr, &data->sock_addr_addr, &data->sock_addr_len);
+  v = caml_alloc_custom(&sockaddr_ops, sizeof(struct sock_addr_data), 0, 1);
+  get_sockaddr(v_sockaddr, &Sock_addr_val(v)->sock_addr_addr,
+               &Sock_addr_val(v)->sock_addr_len);
   CAMLreturn(v);
 }
 
