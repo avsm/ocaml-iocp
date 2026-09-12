@@ -3,7 +3,6 @@
     Bindings to input/output completion ports (IOCP) allowing for efficient,
     asynchronous IO on Windows. *)
 
-module Wsabuf = Wsabuf
 module Overlapped = Overlapped
 module Handle = Handle
 module Raw = Raw

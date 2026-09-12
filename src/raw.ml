@@ -77,21 +77,21 @@ external connect :
   Handle.t -> Sockaddr.t -> 'a Overlapped.t -> unit
   = "ocaml_iocp_connect"
 
-external send : Handle.t -> Wsabuf.t -> 'a Overlapped.t -> unit
+external send : Handle.t -> Cstruct.t list -> 'a Overlapped.t -> unit
   = "ocaml_iocp_send"
 
-external recv : Handle.t -> Wsabuf.t  -> 'a Overlapped.t -> unit
+external recv : Handle.t -> Cstruct.t list  -> 'a Overlapped.t -> unit
   = "ocaml_iocp_recv"
 
 external cancel : Handle.t -> 'a Overlapped.t -> unit = "ocaml_iocp_cancel"
 external cancel_all : Handle.t -> unit = "ocaml_iocp_cancel_all"
 
 external recv_from :
-  Handle.t -> Wsabuf.t -> Sockaddr.t -> 'a Overlapped.t -> unit
+  Handle.t -> Cstruct.t list -> Sockaddr.t -> 'a Overlapped.t -> unit
   = "ocaml_iocp_recv_from"
 
 external send_to :
-  Handle.t -> Wsabuf.t -> Sockaddr.t -> 'a Overlapped.t -> unit
+  Handle.t -> Cstruct.t list -> Sockaddr.t -> 'a Overlapped.t -> unit
   = "ocaml_iocp_send_to"
 
 (* Post a key-only completion packet (no OVERLAPPED); used for wakeups and to

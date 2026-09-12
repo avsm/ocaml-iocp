@@ -112,10 +112,41 @@ ocaml_iocp_extract_sockaddr(value v) {
 // Overlapped data structure:
 // Contains information for asynchronous (i.e. overlapped) input and output
 
+/* Vectors longer than this borrow a heap array instead; almost nothing does. */
+#define EO_INLINE_BUFS 8
+
 typedef struct extended_overlapped {
   OVERLAPPED o;
   value key;
+  WSABUF inline_bufs[EO_INLINE_BUFS];
+  WSABUF *heap_bufs;   /* non-NULL only while a longer vector is in flight */
+  int nbufs;
 } eo;
+
+/* Describe [v_cstructs] in the slot's own WSABUF array. The kernel needs it to
+   stay put until the operation completes, and a slot holds one operation at a
+   time, so it lasts exactly long enough and costs no allocation. */
+static WSABUF *eo_set_bufs(eo *ol, value v_cstructs) {
+  value l;
+  int len = 0, i;
+  WSABUF *bufs;
+
+  for (l = v_cstructs; Is_block(l); l = Field(l, 1)) len++;
+  if (ol->heap_bufs) { caml_stat_free(ol->heap_bufs); ol->heap_bufs = NULL; }
+  if (len <= EO_INLINE_BUFS) {
+    bufs = ol->inline_bufs;
+  } else {
+    ol->heap_bufs = (WSABUF *) caml_stat_alloc(len * sizeof(WSABUF));
+    bufs = ol->heap_bufs;
+  }
+  for (i = 0, l = v_cstructs; i < len; l = Field(l, 1), i++) {
+    value v_cs = Field(l, 0);
+    bufs[i].buf = (CHAR *) Caml_ba_data_val(Field(v_cs, 0)) + Long_val(Field(v_cs, 1));
+    bufs[i].len = (ULONG) Long_val(Field(v_cs, 2));
+  }
+  ol->nbufs = len;
+  return bufs;
+}
 
 static value val_of_overlapped_ptr(eo *ptr)
 {
@@ -133,6 +164,7 @@ static LPOVERLAPPED overlapped_ptr_of_val(value v)
 void ocaml_iocp_free_overlapped(value v) {
     CAMLparam1(v);
     eo *lp=(eo *)overlapped_ptr_of_val(Field(v,0));
+    if (lp->heap_bufs) caml_stat_free(lp->heap_bufs);
     caml_stat_free(lp);
     CAMLreturn0;
 }
@@ -515,46 +547,6 @@ void ocaml_iocp_connect(value v_sock, value v_addr, value v_overlapped) {
 
 // WSABUF
 
-#define Wsabuf_val(v) (*((WSABUF **) Data_custom_val(v)))
-
-static void finalize_wsabuf(value v) {
-  caml_stat_free(Wsabuf_val(v));
-  Wsabuf_val(v) = NULL;
-}
-
-static struct custom_operations wsabuf_ops = {
-  "iocp.wsabuf_ops",
-  finalize_wsabuf,
-  custom_compare_default,
-  custom_hash_default,
-  custom_serialize_default,
-  custom_deserialize_default,
-  custom_compare_ext_default,
-  custom_fixed_length_default
-};
-
-value
-ocaml_iocp_make_wsabuf(value v_cstructs, value v_len) {
-  CAMLparam1(v_cstructs);
-  CAMLlocal2(v, l);
-  int len = Int_val(v_len);
-  int i;
-  WSABUF *bufs;
-  // Allocate the custom block on the OCaml heap:
-  v = caml_alloc_custom_mem(&wsabuf_ops, sizeof(WSABUF *), len * sizeof(WSABUF));
-  Wsabuf_val(v) = NULL;
-  bufs = caml_stat_alloc(len * sizeof(WSABUF));
-  Wsabuf_val(v) = bufs;
-  for (i = 0, l = v_cstructs; i < len; l = Field(l, 1), i++) {
-    value v_cs = Field(l, 0);
-    value v_ba = Field(v_cs, 0);
-    value v_off = Field(v_cs, 1);
-    value v_len = Field(v_cs, 2);
-    bufs[i].buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
-    bufs[i].len = Long_val(v_len);
-  }
-  CAMLreturn(v);
-}
 
 void
 ocaml_iocp_send(value v_sock, value v_wsabuf, value v_overlapped) {
@@ -562,8 +554,8 @@ ocaml_iocp_send(value v_sock, value v_wsabuf, value v_overlapped) {
   DWORD received;
   LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
 
-  WSABUF *wsabuf = Wsabuf_val(Field(v_wsabuf, 0));
-  int len = Int_val(Field(v_wsabuf, 1));
+  WSABUF *wsabuf = eo_set_bufs((eo *)ol, v_wsabuf);
+  int len = ((eo *)ol)->nbufs;
 
   int i = WSASend(
     Socket_val(v_sock),
@@ -592,8 +584,8 @@ ocaml_iocp_recv(value v_sock, value v_wsabuf, value v_overlapped) {
   DWORD received, flags;
   LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
 
-  WSABUF *wsabuf = Wsabuf_val(Field(v_wsabuf, 0));
-  int len = Int_val(Field(v_wsabuf, 1));
+  WSABUF *wsabuf = eo_set_bufs((eo *)ol, v_wsabuf);
+  int len = ((eo *)ol)->nbufs;
 
 
   flags = 0;
@@ -733,8 +725,8 @@ ocaml_iocp_recv_from(value v_sock, value v_wsabuf, value v_sockaddr, value v_ove
   CAMLparam4(v_sock, v_wsabuf, v_sockaddr, v_overlapped);
   DWORD received, flags = 0;
   LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
-  WSABUF *wsabuf = Wsabuf_val(Field(v_wsabuf, 0));
-  int len = Int_val(Field(v_wsabuf, 1));
+  WSABUF *wsabuf = eo_set_bufs((eo *)ol, v_wsabuf);
+  int len = ((eo *)ol)->nbufs;
   struct sock_addr_data *data = Sock_addr_val(v_sockaddr);
 
   /* [sock_addr_len] is in/out: initialise it to the buffer capacity. */
@@ -756,8 +748,8 @@ ocaml_iocp_send_to(value v_sock, value v_wsabuf, value v_sockaddr, value v_overl
   CAMLparam4(v_sock, v_wsabuf, v_sockaddr, v_overlapped);
   DWORD sent;
   LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
-  WSABUF *wsabuf = Wsabuf_val(Field(v_wsabuf, 0));
-  int len = Int_val(Field(v_wsabuf, 1));
+  WSABUF *wsabuf = eo_set_bufs((eo *)ol, v_wsabuf);
+  int len = ((eo *)ol)->nbufs;
   struct sock_addr_data *data = Sock_addr_val(v_sockaddr);
 
   int i = WSASendTo(Socket_val(v_sock), wsabuf, len, &sent, 0,

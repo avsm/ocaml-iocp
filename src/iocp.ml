@@ -3,7 +3,6 @@
    Distributed under the MIT license. See terms at the end of this file.
   ----------------------------------------------------------------------*)
 
-module Wsabuf = Wsabuf
 module Sockaddr = Sockaddr
 module Handle = Handle
 module Overlapped = Overlapped
@@ -24,8 +23,8 @@ module H = Hashtbl.Make(Id)
 (* Values that must stay rooted for the lifetime of an in-flight operation. *)
 type roots =
   | ReadWrite of Cstruct.buffer
-  | RecvSend of Wsabuf.t
-  | RecvSendAddr of Wsabuf.t * Sockaddr.t
+  | RecvSend of Cstruct.t list
+  | RecvSendAddr of Cstruct.t list * Sockaddr.t
   | Connect of Sockaddr.t
 
 (* A [t] is owned by a single domain: submission, reaping and cancellation must
@@ -122,22 +121,16 @@ let accept v sock sock_accept addr_buf =
   let buf = Cstruct.to_bigarray addr_buf in
   submit v sock (ReadWrite buf) (fun ol -> Raw.accept sock sock_accept buf ol)
 
-let recv v sock bufs =
-  let wsabuf = Wsabuf.create bufs in
-  submit v sock (RecvSend wsabuf) (fun ol -> Raw.recv sock wsabuf ol)
+let recv v sock bufs = submit v sock (RecvSend bufs) (fun ol -> Raw.recv sock bufs ol)
 
-let send v sock bufs =
-  let wsabuf = Wsabuf.create bufs in
-  submit v sock (RecvSend wsabuf) (fun ol -> Raw.send sock wsabuf ol)
+let send v sock bufs = submit v sock (RecvSend bufs) (fun ol -> Raw.send sock bufs ol)
 
 (* [addr] is filled in with the source on completion, so it must stay alive. *)
 let recv_from v sock bufs addr =
-  let wsabuf = Wsabuf.create bufs in
-  submit v sock (RecvSendAddr (wsabuf, addr)) (fun ol -> Raw.recv_from sock wsabuf addr ol)
+  submit v sock (RecvSendAddr (bufs, addr)) (fun ol -> Raw.recv_from sock bufs addr ol)
 
 let send_to v sock bufs addr =
-  let wsabuf = Wsabuf.create bufs in
-  submit v sock (RecvSendAddr (wsabuf, addr)) (fun ol -> Raw.send_to sock wsabuf addr ol)
+  submit v sock (RecvSendAddr (bufs, addr)) (fun ol -> Raw.send_to sock bufs addr ol)
 
 let connect v sock addr =
   submit v sock (Connect addr) (fun ol -> Raw.connect sock addr ol)
