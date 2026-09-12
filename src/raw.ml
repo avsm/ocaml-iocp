@@ -35,6 +35,11 @@ type completion_status = private
       error : Unix.error option;
     }
 
+external get_queued_completion_status_ex : t -> int -> int array -> int
+  = "ocaml_iocp_get_queued_completion_status_ex"
+
+external unix_error_of_win32 : int -> Unix.error = "ocaml_iocp_unix_error_of_win32"
+
 external get_queued_completion_status : t -> int -> completion_status
   = "ocaml_iocp_get_queued_completion_status"
 

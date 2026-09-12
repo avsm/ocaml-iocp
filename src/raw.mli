@@ -24,6 +24,15 @@ type completion_status = private
       error : Unix.error option;
     }
 
+(** [get_queued_completion_status_ex t timeout entries] dequeues as many
+    packets as are ready into [entries], four ints per packet: completion
+    key, bytes transferred, overlapped id, Win32 error (0 for none).
+    Returns how many were taken. *)
+external get_queued_completion_status_ex : t -> int -> int array -> int
+  = "ocaml_iocp_get_queued_completion_status_ex"
+
+external unix_error_of_win32 : int -> Unix.error = "ocaml_iocp_unix_error_of_win32"
+
 external get_queued_completion_status : t -> int -> completion_status
   = "ocaml_iocp_get_queued_completion_status"
 

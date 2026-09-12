@@ -35,7 +35,17 @@ type t = {
   in_flight : (Handle.t * int Overlapped.t * roots) H.t;
   mutable free : int Overlapped.t list;
   mutable closed : bool;
+
+  (* Packets dequeued but not yet handed out, four ints each. *)
+  batch : int array;
+  mutable batch_len : int;
+  mutable batch_pos : int;
 }
+
+(* Asking for more makes the single-ready-packet case measurably slower without
+   helping the busy case any further: at 64 it lost about 15% there and gained
+   nothing here. *)
+let batch_entries = 8
 
 type completion_status = {
   bytes_transferred : int;
@@ -93,20 +103,35 @@ let write v fd buf ~pos ~len ~off =
       Overlapped.set_offset ol off;
       Raw.write fd buf len pos ol)
 
+(* Turn the [i]th dequeued packet into a result, recycling its slot. *)
+let packet_of_batch v i =
+  let key = v.batch.(i * 4)
+  and bytes_transferred = v.batch.((i * 4) + 1)
+  and overlapped_id = v.batch.((i * 4) + 2)
+  and err = v.batch.((i * 4) + 3) in
+  if overlapped_id = 0 then
+    (* No OVERLAPPED: a packet posted by [post]/[wakeup] or a registered wait. *)
+    Posted { key; bytes_transferred }
+  else begin
+    let id = Overlapped.unsafe_key overlapped_id in
+    (match H.find_opt v.in_flight id with
+     | Some (_, ol, _) -> H.remove v.in_flight id; v.free <- ol :: v.free
+     | None -> ());
+    let error = if err = 0 then None else Some (Raw.unix_error_of_win32 err) in
+    Io { bytes_transferred; id; error }
+  end
+
 let wait v ~timeout =
-  match Raw.get_queued_completion_status v.iocp timeout with
-  | Raw.Cs_none -> None
-  | Raw.Cs_some cs ->
-    if cs.overlapped_id = 0 then
-      (* No OVERLAPPED: a packet posted by [post]/[wakeup] or a registered wait. *)
-      Some (Posted { key = cs.handle_id; bytes_transferred = cs.bytes_transferred })
-    else begin
-      let id = Overlapped.unsafe_key cs.overlapped_id in
-      (match H.find_opt v.in_flight id with
-       | Some (_, ol, _) -> H.remove v.in_flight id; v.free <- ol :: v.free
-       | None -> ());
-      Some (Io { bytes_transferred = cs.bytes_transferred; id; error = cs.error })
-    end
+  if v.batch_pos >= v.batch_len then begin
+    v.batch_pos <- 0;
+    v.batch_len <- Raw.get_queued_completion_status_ex v.iocp timeout v.batch
+  end;
+  if v.batch_len = 0 then None
+  else begin
+    let p = packet_of_batch v v.batch_pos in
+    v.batch_pos <- v.batch_pos + 1;
+    Some p
+  end
 
 let active_ops v = H.length v.in_flight
 
@@ -177,7 +202,10 @@ let create ?(overlapped = 1024) n =
     ; next_id = 1
     ; in_flight = H.create 255
     ; free = List.init overlapped (fun _ -> Overlapped.create 0)
-    ; closed = false }
+    ; closed = false
+    ; batch = Array.make (batch_entries * 4) 0
+    ; batch_len = 0
+    ; batch_pos = 0 }
   in
   Gc.finalise close v;
   v

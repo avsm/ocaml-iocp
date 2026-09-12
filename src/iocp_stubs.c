@@ -308,6 +308,66 @@ value ocaml_iocp_get_queued_completion_status(value v_fd, value v_timeout) {
     CAMLreturn(v);
 }
 
+/* Entries per GetQueuedCompletionStatusEx call. The array is on the stack, and
+   a port with more than this ready simply takes another trip. */
+#define EX_BATCH 64
+
+/* An entry's status is an NTSTATUS in the OVERLAPPED it points at; the rest of
+   the binding speaks Win32 error codes. */
+typedef ULONG (WINAPI *pRtlNtStatusToDosError)(LONG);
+
+static DWORD entry_error(OVERLAPPED_ENTRY *e) {
+  static pRtlNtStatusToDosError convert;
+  if (e->lpOverlapped == NULL) return 0;   /* a posted packet carries no status */
+  if (convert == NULL)
+    convert = (pRtlNtStatusToDosError)
+      GetProcAddress(GetModuleHandle("ntdll.dll"), "RtlNtStatusToDosError");
+  if (convert == NULL) return 0;
+  return convert((LONG)e->lpOverlapped->Internal);
+}
+
+/* Dequeue as many completion packets as are ready, in one call rather than one
+   per packet, writing them into [v_entries] as (key, bytes, overlapped id,
+   error) quadruples. Returns how many were taken. */
+value ocaml_iocp_get_queued_completion_status_ex(value v_fd, value v_timeout, value v_entries) {
+    CAMLparam3(v_fd, v_timeout, v_entries);
+    OVERLAPPED_ENTRY entries[EX_BATCH];
+    ULONG removed = 0, i, max;
+    BOOL b;
+    DWORD err;
+
+    max = (ULONG)(Wosize_val(v_entries) / 4);
+    if (max > EX_BATCH) max = EX_BATCH;
+
+    caml_enter_blocking_section();
+    b = GetQueuedCompletionStatusEx(Handle_val(v_fd), entries, max, &removed,
+                                    Int_val(v_timeout), FALSE);
+    caml_leave_blocking_section();
+
+    if (!b) {
+      err = GetLastError();
+      if (err == WAIT_TIMEOUT || err == ERROR_SUCCESS) CAMLreturn(Val_int(0));
+      win32_maperr(err);
+      uerror("GetQueuedCompletionStatusEx", Nothing);
+    }
+
+    for (i = 0; i < removed; i++) {
+      /* All four are immediates, so they can go straight in. */
+      Field(v_entries, i * 4)     = Val_int((intnat)entries[i].lpCompletionKey);
+      Field(v_entries, i * 4 + 1) = Val_int(entries[i].dwNumberOfBytesTransferred);
+      Field(v_entries, i * 4 + 2) = val_of_overlapped_ptr((eo *)entries[i].lpOverlapped);
+      Field(v_entries, i * 4 + 3) = Val_int(entry_error(&entries[i]));
+    }
+    CAMLreturn(Val_int(removed));
+}
+
+/* Translate one Win32 error code, for the rare entry that carries one. */
+value ocaml_iocp_unix_error_of_win32(value v_err) {
+    CAMLparam1(v_err);
+    win32_maperr((DWORD)Long_val(v_err));
+    CAMLreturn(unix_error_of_code(errno));
+}
+
 void ocaml_iocp_get_queued_completion_status_unsafe(value v_fd, value v_timeout, value v) {
     CAMLparam3(v_fd, v_timeout, v);
     BOOL b = 0;
