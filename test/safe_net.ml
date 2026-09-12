@@ -20,20 +20,20 @@ let listen () =
   let iocp = Iocp.create 5 in
   let sock, sock_accept = listening_sock iocp in
   Format.eprintf "Got an accepting socket\n%!";
-  let addr_buf = Iocp.Accept_buffer.create () in
-  let id = Iocp.accept iocp sock sock_accept addr_buf in
+  let addr_buf = Iocp.Sockaddr.accept_buffer () in
+  let id = Option.get (Iocp.accept iocp sock sock_accept addr_buf) in
   Format.eprintf "Called accept\n%!";
-  match Iocp.completion_status iocp ~timeout:1000 with
-  | None -> assert false
-  | Some t ->
+  match Iocp.wait iocp ~timeout:1000 with
+  | None | Some (Iocp.Posted _) -> assert false
+  | Some (Iocp.Io t) ->
     assert (Iocp.Id.equal t.id id);
-    let client_addr = Iocp.Accept_buffer.get_remote addr_buf sock in
+    let client_addr = Iocp.Sockaddr.of_accept_buffer addr_buf ~listen:sock in
     print_sockaddr @@ Iocp.Sockaddr.get client_addr;
     let buf = Cstruct.create 4096 in
-    let id2 = Iocp.recv iocp sock_accept [buf] in
-    match Iocp.completion_status iocp ~timeout:1000 with
-    | None -> assert false
-    | Some t ->
+    let id2 = Option.get (Iocp.recv iocp sock_accept [buf]) in
+    match Iocp.wait iocp ~timeout:1000 with
+    | None | Some (Iocp.Posted _) -> assert false
+    | Some (Iocp.Io t) ->
       assert (Iocp.Id.equal t.id id2);
       print_endline (Cstruct.to_string buf)
 
@@ -43,18 +43,18 @@ let connect () =
   let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Unix.bind sock (ADDR_INET (Unix.inet_addr_any, 0)); 
   let sock = Iocp.handle_of_fd iocp sock 3 in
-  let id = Iocp.connect iocp sock (Iocp.Sockaddr.of_unix addr) in
-  match Iocp.completion_status iocp ~timeout:1000 with
-  | None -> assert false
-  | Some t ->
+  let id = Option.get (Iocp.connect iocp sock (Iocp.Sockaddr.of_unix addr)) in
+  match Iocp.wait iocp ~timeout:1000 with
+  | None | Some (Iocp.Posted _) -> assert false
+  | Some (Iocp.Io t) ->
     assert (Iocp.Id.equal t.id id);
     print_endline "Connected! Now sending data...";
     let buf = Cstruct.of_string "Hello socket!" in
-    let id2 = Iocp.send iocp sock [buf] in
+    let id2 = Option.get (Iocp.send iocp sock [buf]) in
     print_endline "Data queued up...";
-    match Iocp.completion_status iocp ~timeout:1000 with
-    | None -> assert false
-    | Some t ->
+    match Iocp.wait iocp ~timeout:1000 with
+    | None | Some (Iocp.Posted _) -> assert false
+    | Some (Iocp.Io t) ->
       assert (Iocp.Id.equal t.id id2);
       print_endline "All done!"
     

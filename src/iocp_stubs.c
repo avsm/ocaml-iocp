@@ -1,5 +1,3 @@
-// Sockaddr implementation borrow from io_uring bindings
-
 /*
  * Copyright (C) 2020-2021 Anil Madhavapeddy
  * Copyright (C) 2020-2021 Sadiq Jaffer
@@ -40,6 +38,23 @@
 #include <stdio.h>
 #include <assert.h>
 
+/* Force these (header-declared plain [extern]) through the import table: as
+   REL32 calls flexdll can't relocate them when the runtime DLL maps >2GB away. */
+CAMLextern value caml_win32_alloc_handle(HANDLE);
+CAMLextern void caml_win32_maperr(DWORD errcode);
+CAMLextern value caml_unix_error_of_code(int errcode);
+CAMLnoret CAMLextern void caml_uerror(const char *cmdname, value arg);
+CAMLextern void caml_unix_check_path(value path, const char *cmdname);
+/* Since 5.5 these two are _Generic macros over the real [struct sockaddr]
+   entry points, so a redeclaration in the union form expands rather than
+   declares. Parenthesise the name to name the underlying symbol instead. */
+#ifdef caml_unix_alloc_sockaddr
+CAMLextern void (caml_unix_get_sockaddr)(value mladdr, struct sockaddr_storage *addr, socklen_t *addr_len);
+CAMLextern value (caml_unix_alloc_sockaddr)(struct sockaddr *addr, socklen_t addr_len, int close_on_error);
+#else
+CAMLextern void caml_unix_get_sockaddr(value mladdr, union sock_addr_union *addr, socklen_param_type *addr_len);
+CAMLextern value caml_unix_alloc_sockaddr(union sock_addr_union *addr, socklen_param_type addr_len, int close_on_error);
+#endif
 
 #define SIZEBUF 4096
 
@@ -111,7 +126,7 @@ static value val_of_overlapped_ptr(eo *ptr)
 static LPOVERLAPPED overlapped_ptr_of_val(value v)
 {
   assert(v != 0);
-  assert(v & 1 == 1);
+  assert((v & 1) == 1);
   return (LPOVERLAPPED) (v & ~1);
 }
 
@@ -141,9 +156,13 @@ CAMLprim value ocaml_iocp_alloc_overlapped(value key) {
 void ocaml_iocp_set_overlapped_off(value v, value off) {
   CAMLparam2(v, off);
   LPOVERLAPPED ol=overlapped_ptr_of_val(Field(v,0));
+  /* Split the 63-bit file offset across Offset/OffsetHigh so that positioned
+     reads/writes past 4 GB address the correct location (Offset alone is only
+     32-bit). */
+  ULONG64 o = (ULONG64)(intnat)Long_val(off);
   memset(ol, 0, sizeof(OVERLAPPED));
-  ol->Offset = Int_val(off);
-  ol->OffsetHigh = 0;
+  ol->Offset = (DWORD)o;
+  ol->OffsetHigh = (DWORD)(o >> 32);
   CAMLreturn0;
 }
 
@@ -155,7 +174,9 @@ value ocaml_iocp_get_overlapped_key(value v) {
 
 void ocaml_iocp_set_overlapped_key(value v, value key) {
   CAMLparam2(v, key);
-  eo *ol = (eo *)overlapped_ptr_of_val(v);
+  /* [v] is the boxed overlapped; field 0 holds the tagged pointer (cf.
+     ocaml_iocp_set_overlapped_off). */
+  eo *ol = (eo *)overlapped_ptr_of_val(Field(v, 0));
   if(Is_block(key)) {
       caml_invalid_argument("Overlapped key must be an immediate");
   }
@@ -173,14 +194,10 @@ value ocaml_iocp_create_io_completion_port(value v_threads) {
 
     if (cp == NULL) {
       win32_maperr(GetLastError());
-      // printf("RETURNING FAILED %i\n", GetLastError());
       uerror("CreateIoCompletionPort", Nothing);
     }
 
-    v = win_alloc_handle(cp);
-
-    Handle_val(v) = cp;
-    CAMLreturn(v);
+    CAMLreturn(win_alloc_handle(cp));
 }
 
 value ocaml_iocp_associate_fd_with_iocp(value v_iocp, value v_fd, value v_key) {
@@ -189,50 +206,18 @@ value ocaml_iocp_associate_fd_with_iocp(value v_iocp, value v_fd, value v_key) {
     HANDLE handle = Handle_val(v_fd);
     HANDLE iocp = Handle_val(v_iocp);
 
-    HANDLE cp = CreateIoCompletionPort(handle, iocp, v_key, 0);
+    /* Store the raw integer key so it round-trips through
+       GetQueuedCompletionStatus's completion-key out-param unchanged. */
+    HANDLE cp = CreateIoCompletionPort(handle, iocp, (ULONG_PTR)Long_val(v_key), 0);
 
     if (cp == NULL) {
       win32_maperr(GetLastError());
-      // printf("RETURNING FAILED %i\n", GetLastError());
       uerror("CreateIoCompletionPort", Nothing);
     }
 
     CAMLreturn(v_fd);
 
 }
-// The key cannot be GC'd until the event is complete
-value ocaml_iocp_create_io_completion_port_with_fd(value v_fd, value v_threads, value v_key) {
-    CAMLparam3(v_fd, v_threads, v_key);
-    CAMLlocal1(v);
-    int num_threads = Int_val(v_threads);
-
-    HANDLE handle = Handle_val(v_fd);
-    HANDLE cp = CreateIoCompletionPort(handle, NULL, v_key, num_threads);
-
-    if (cp == NULL) {
-      win32_maperr(GetLastError());
-      // printf("RETURNING FAILED %i\n", GetLastError());
-      uerror("CreateIoCompletionPort", Nothing);
-    }
-
-    v = win_alloc_handle(cp);
-
-    Handle_val(v) = cp;
-    CAMLreturn(v);
-}
-
-#define Val_cqe_none Val_int(0)
-
-static value Val_completion_status(value v_id, value v_bytes, value v_overlapped) {
-    CAMLparam2(v_id, v_bytes);
-    CAMLlocal1(v);
-    v = caml_alloc(3, 0);
-    Store_field(v, 0, v_id);
-    Store_field(v, 1, v_bytes);
-    Store_field(v, 2, v_overlapped);
-    CAMLreturn(v);
-}
-
 value ocaml_iocp_get_queued_completion_status(value v_fd, value v_timeout) {
     CAMLparam2(v_fd, v_timeout);
     CAMLlocal2(v,v_err);
@@ -248,11 +233,6 @@ value ocaml_iocp_get_queued_completion_status(value v_fd, value v_timeout) {
     b = GetQueuedCompletionStatus(fd, &transferred, &ptr, &ol, Int_val(v_timeout));
     caml_leave_blocking_section();
 
-    if (b && ol == NULL) {
-      printf("Unknown status: returned 'true', but ol is null");
-      CAMLreturn(Val_int(0)); /* success, nothing to return (hit timeout) */
-    }
-
     /* Indicates an error with the call to GetQueuedCompletionStatus */
     if (!b && ol == NULL) {
       /* A timeout is an OK result, don't raise an exception */
@@ -267,7 +247,6 @@ value ocaml_iocp_get_queued_completion_status(value v_fd, value v_timeout) {
 
       /* For all other errors, raise a Unix_error */
       win32_maperr(err);
-      // printf("RETURNING FAILED %i\n", err);
       uerror("QueuedCompletionStatus", Nothing);
     }
 
@@ -296,7 +275,6 @@ void ocaml_iocp_get_queued_completion_status_unsafe(value v_fd, value v_timeout,
     DWORD err=0;
     LPOVERLAPPED ol = NULL;
 
-    // printf("ocaml_iocp_get_queued_completion_status_unsafe: here we go!\n");
 
     caml_enter_blocking_section();
     b = GetQueuedCompletionStatus(fd, &transferred, &ptr, &ol, Int_val(v_timeout));
@@ -314,117 +292,69 @@ void ocaml_iocp_get_queued_completion_status_unsafe(value v_fd, value v_timeout,
     Store_field(v, 3, Val_bool(b));
     Store_field(v, 4, Val_int(err));
 
-    // printf("OK, ol=%p res=%d err=%d\n",(void *)ol,b,err);
     CAMLreturn0;
 }
 
-value ocaml_iocp_peek(value v_fd) {
-    CAMLparam1(v_fd);
-    CAMLlocal1(v);
-    BOOL b = 0;
-    HANDLE fd = Handle_val(v_fd);
-    DWORD transferred = 0;
-    DWORD_PTR ptr = 0 ;
-    LPOVERLAPPED ol = NULL;
-
-    caml_enter_blocking_section();
-    b = GetQueuedCompletionStatus(fd, &transferred, &ptr, &ol, 0);
-    caml_leave_blocking_section();
-
-    if (!b && GetLastError() != ERROR_HANDLE_EOF) {
-      // win32_maperr(GetLastError());
-      // uerror("CreateNamedPipe", Nothing);
-      //CAMLreturn(Val_cqe_none);
-    }
-    v = caml_alloc(3, 0);
-    Store_field(v, 0, Val_int(ptr));
-    Store_field(v, 1, Val_int(transferred));
-    Store_field(v, 2, val_of_overlapped_ptr((eo *)ol));
-    CAMLreturn(v);
-}
-
-void ocaml_iocp_read(value v_cp, value v_fd, value v_ba, value v_num_bytes, value v_off, value v_overlapped) {
-    CAMLparam4(v_cp, v_fd, v_ba, v_overlapped);
+value ocaml_iocp_read(value v_fd, value v_ba, value v_num_bytes, value v_off, value v_overlapped) {
+    CAMLparam3(v_fd, v_ba, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
-
-    // printf("READ FILE %i %i %i %i\n", Handle_val(v_fd), Int_val(v_off), Int_val(v_num_bytes), ol->Offset);
-
-    // Here we associate the file handle to the completion port handle...
     void *buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
     BOOL b = ReadFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
-    // The return value is non-zero (TRUE) on success. However, it is FALSE if the IO operation
-    // is completing asynchronously. We change that behaviour by checking last error.
+    // FALSE with ERROR_IO_PENDING just means the op is running asynchronously.
     if (!b) {
       DWORD err = GetLastError();
-      if(err == ERROR_IO_PENDING) {
-        // printf("Returned pending\n");
-        CAMLreturn0;
-      }
+      if(err == ERROR_IO_PENDING) CAMLreturn(Val_unit);
       win32_maperr(err);
       uerror("ReadFile", Nothing);
     }
-    CAMLreturn0;
+    CAMLreturn(Val_unit);
 }
 
-void ocaml_iocp_read_bytes(value* values, int argc) {
-    return ocaml_iocp_read(values[0], values[1], values[2], values[3], values[4], values[5]);
-}
-
-void ocaml_iocp_write(value v_cp, value v_fd, value v_ba, value v_num_bytes, value v_off, value v_overlapped) {
-    CAMLparam5(v_cp, v_fd, v_ba, v_num_bytes, v_off);
-    CAMLxparam1(v_overlapped);
+value ocaml_iocp_write(value v_fd, value v_ba, value v_num_bytes, value v_off, value v_overlapped) {
+    CAMLparam3(v_fd, v_ba, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
-
-    // printf("iocp_write - overlapped=%p\n\n",(void*) ol);
-    // Here we associate the file handle to the completion port handle...
     void *buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
     BOOL b = WriteFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
-
-    // The return value is non-zero (TRUE) on success. However, it is FALSE if the IO operation
-    // is completing asynchronously. We change that behaviour by checking last error.
     if (!b) {
       DWORD err = GetLastError();
-      if(err == ERROR_IO_PENDING) {
-        // printf("Returned pending\n");
-        CAMLreturn0;
-      }
+      if(err == ERROR_IO_PENDING) CAMLreturn(Val_unit);
       win32_maperr(err);
       uerror("WriteFile", Nothing);
     }
-    CAMLreturn0;
-}
-
-void ocaml_iocp_write_bytes(value* values, int argc) {
-    return ocaml_iocp_write(values[0], values[1], values[2], values[3], values[4], values[5]);
+    CAMLreturn(Val_unit);
 }
 
 GUID GuidGetAddrAcceptEx = WSAID_GETACCEPTEXSOCKADDRS;
 
+static LPFN_GETACCEPTEXSOCKADDRS get_accept_ex_sockaddrs(SOCKET s) {
+    static LPFN_GETACCEPTEXSOCKADDRS fn = NULL;
+    if (fn == NULL) {
+      DWORD dwBytes;
+      if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &GuidGetAddrAcceptEx, sizeof(GuidGetAddrAcceptEx),
+                   &fn, sizeof(fn), &dwBytes, NULL, NULL) == SOCKET_ERROR)
+        fn = NULL;
+    }
+    return fn;
+}
+
+value ocaml_iocp_accept_buffer_size(value v_unit) {
+    CAMLparam1(v_unit);
+    CAMLreturn(Val_int(2 * (sizeof(union sock_addr_union) + 16)));
+}
+
 value ocaml_iocp_get_accept_ex_sockaddr(value v_accept_buffer, value v_listen, value v_sockaddr) {
     CAMLparam3(v_listen, v_accept_buffer, v_sockaddr);
-    LPFN_GETACCEPTEXSOCKADDRS lpfnGetAcceptExSockaddrs = NULL;
-    DWORD dwBytes;
-    int result;
-
-    result = WSAIoctl(
-        Socket_val(v_listen), 
-        SIO_GET_EXTENSION_FUNCTION_POINTER,
-        &GuidGetAddrAcceptEx,
-        sizeof(GuidGetAddrAcceptEx),
-        &lpfnGetAcceptExSockaddrs,
-        sizeof(lpfnGetAcceptExSockaddrs),
-        &dwBytes, NULL, NULL);
-
-    if (result == SOCKET_ERROR) {
-        printf("Socket address error\n");
-        CAMLreturn(Val_false);
-    }
-    
     int lsize = 0;
     SOCKADDR *pLocal = NULL, *pRemote = NULL;
-    
     struct sock_addr_data *data = Sock_addr_val(v_sockaddr);
-    // struct sockaddr_in *remote = &(data->sock_addr_addr.s_gen);
+
+    LPFN_GETACCEPTEXSOCKADDRS lpfnGetAcceptExSockaddrs =
+        get_accept_ex_sockaddrs(Socket_val(v_listen));
+    if (lpfnGetAcceptExSockaddrs == NULL) {
+        win32_maperr(WSAGetLastError());
+        uerror("WSAIoctl", Nothing);
+    }
 
     lpfnGetAcceptExSockaddrs(
         Caml_ba_data_val(v_accept_buffer),
@@ -436,51 +366,37 @@ value ocaml_iocp_get_accept_ex_sockaddr(value v_accept_buffer, value v_listen, v
         &pRemote,
         &(data->sock_addr_len));
 
-    // TODO: Is there a non-copying way to get this to work?
     memcpy(&(data->sock_addr_addr), pRemote, data->sock_addr_len);
 
     CAMLreturn(Val_unit);
 }
 
-// We have to retrieve a pointer to AcceptEx at runtime
 GUID GuidAcceptEx = WSAID_ACCEPTEX;
+
+static LPFN_ACCEPTEX get_accept_ex(SOCKET s) {
+    static LPFN_ACCEPTEX fn = NULL;
+    if (fn == NULL) {
+      DWORD dwBytes;
+      if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &GuidAcceptEx, sizeof(GuidAcceptEx),
+                   &fn, sizeof(fn), &dwBytes, NULL, NULL) == SOCKET_ERROR)
+        fn = NULL;
+    }
+    return fn;
+}
 
 void ocaml_iocp_accept(value v_listen, value v_accept, value v_accept_buffer, value v_overlapped) {
     CAMLparam4(v_listen, v_accept, v_accept_buffer, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
     DWORD received;
-    int result;
 
-    printf("got overlapped: %p\n", ol);
+    LPFN_ACCEPTEX lpfnAcceptEx = get_accept_ex(Socket_val(v_listen));
 
-    LPFN_ACCEPTEX lpfnAcceptEx = NULL;
-    DWORD dwBytes;
-
-        SOCKET sock;
-            sock = socket(AF_INET, SOCK_STREAM, 0);
-    printf("about to call WSAIoctl\n");
-    result = WSAIoctl(
-        sock, 
-        SIO_GET_EXTENSION_FUNCTION_POINTER,
-        &GuidAcceptEx,
-        sizeof(GuidAcceptEx),
-        &lpfnAcceptEx,
-        sizeof(lpfnAcceptEx),
-        &dwBytes, NULL, NULL);
-
-    printf("Called WSAIoctl\n");
-    fflush(stdout);
-
-    if (result == SOCKET_ERROR) {
-      DWORD err = WSAGetLastError();
-      win32_maperr(err);
+    if (lpfnAcceptEx == NULL) {
+      win32_maperr(WSAGetLastError());
       uerror("WSAIoctl", Nothing);
     }
-    printf("Called WSAIoctl, no error\n");
 
-    // By default, AcceptEx wants to wait for the connection along with first bit of data. The buffer it
-    // accepts as an argument wants data for the first incoming message, the local address and the remote
-    // address. We're only interested in the remote address.
     BOOL b = lpfnAcceptEx(
         Socket_val(v_listen),               // The listening socket
         Socket_val(v_accept),               // A socket on which to accept an incoming connection (not bound or connected) ?
@@ -491,14 +407,9 @@ void ocaml_iocp_accept(value v_listen, value v_accept, value v_accept_buffer, va
         &received,                          // Pointer to DWORD for number of bytes received
         ol);                                // The OVERLAPPED structure
 
-    printf("Called AcceptEx\n");
-    fflush(stdout);
-    // The return value is non-zero (TRUE) on success. However, it is FALSE if the IO operation
-    // is completing asynchronously. We change that behaviour by checking last error.
     if (!b) {
       DWORD err = WSAGetLastError();
       if(err == ERROR_IO_PENDING) {
-        // printf("Returned pending\n");
         CAMLreturn0;
       }
       win32_maperr(err);
@@ -507,30 +418,29 @@ void ocaml_iocp_accept(value v_listen, value v_accept, value v_accept_buffer, va
     CAMLreturn0;
 }
 
-// We have to retrieve a pointer to AcceptEx at runtime
 GUID GuidConnectEx = WSAID_CONNECTEX;
 
-void ocaml_iocp_connect(value v_cp, value v_sock, value v_addr, value v_overlapped) {
-    CAMLparam4(v_cp, v_sock, v_addr, v_overlapped);
+static LPFN_CONNECTEX get_connect_ex(SOCKET s) {
+    static LPFN_CONNECTEX fn = NULL;
+    if (fn == NULL) {
+      DWORD dwBytes;
+      if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &GuidConnectEx, sizeof(GuidConnectEx),
+                   &fn, sizeof(fn), &dwBytes, NULL, NULL) == SOCKET_ERROR)
+        fn = NULL;
+    }
+    return fn;
+}
+
+void ocaml_iocp_connect(value v_sock, value v_addr, value v_overlapped) {
+    CAMLparam3(v_sock, v_addr, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
     DWORD received;
-    int result;
 
-    LPFN_CONNECTEX lpfnConnectEx = NULL;
-    DWORD dwBytes;
+    LPFN_CONNECTEX lpfnConnectEx = get_connect_ex(Socket_val(v_sock));
 
-    result = WSAIoctl(
-        Socket_val(v_sock), 
-        SIO_GET_EXTENSION_FUNCTION_POINTER,
-        &GuidConnectEx,
-        sizeof(GuidConnectEx),
-        &lpfnConnectEx,
-        sizeof(lpfnConnectEx),
-        &dwBytes, NULL, NULL);
-
-    if (result == SOCKET_ERROR) {
-        DWORD err = WSAGetLastError();
-        win32_maperr(err);
+    if (lpfnConnectEx == NULL) {
+        win32_maperr(WSAGetLastError());
         uerror("WSAIoctl", Nothing);
     }
 
@@ -550,7 +460,6 @@ void ocaml_iocp_connect(value v_cp, value v_sock, value v_addr, value v_overlapp
     if (!b) {
       DWORD err = GetLastError();
       if(err == ERROR_IO_PENDING) {
-        // printf("Returned pending\n");
         CAMLreturn0;
       }
       win32_maperr(err);
@@ -587,7 +496,7 @@ ocaml_iocp_make_wsabuf(value v_cstructs, value v_len) {
   int i;
   WSABUF *bufs;
   // Allocate the custom block on the OCaml heap:
-  v = caml_alloc_custom_mem(&wsabuf_ops, sizeof(struct wsabuf_ops *), len * sizeof(WSABUF));
+  v = caml_alloc_custom_mem(&wsabuf_ops, sizeof(WSABUF *), len * sizeof(WSABUF));
   Wsabuf_val(v) = NULL;
   bufs = caml_stat_alloc(len * sizeof(WSABUF));
   Wsabuf_val(v) = bufs;
@@ -598,14 +507,13 @@ ocaml_iocp_make_wsabuf(value v_cstructs, value v_len) {
     value v_len = Field(v_cs, 2);
     bufs[i].buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
     bufs[i].len = Long_val(v_len);
-    // dprintf("adding wsabuf %d: %p (%ld, %ld)\n", i, bufs[i].buf, Long_val(v_off), Long_val(v_len));
   }
   CAMLreturn(v);
 }
 
 void
-ocaml_iocp_send(value v_cp, value v_sock, value v_wsabuf, value v_overlapped) {
-  CAMLparam4(v_cp, v_sock, v_wsabuf, v_overlapped);
+ocaml_iocp_send(value v_sock, value v_wsabuf, value v_overlapped) {
+  CAMLparam3(v_sock, v_wsabuf, v_overlapped);
   DWORD received;
   LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
 
@@ -625,7 +533,6 @@ ocaml_iocp_send(value v_cp, value v_sock, value v_wsabuf, value v_overlapped) {
   if (i==SOCKET_ERROR) {
       DWORD err = WSAGetLastError();
       if(err == ERROR_IO_PENDING) {
-        // printf("Returned pending\n");
         CAMLreturn0;
       }
       win32_maperr(err);
@@ -635,8 +542,8 @@ ocaml_iocp_send(value v_cp, value v_sock, value v_wsabuf, value v_overlapped) {
 }
 
 void
-ocaml_iocp_recv(value v_cp, value v_sock, value v_wsabuf, value v_overlapped) {
-  CAMLparam4(v_cp, v_sock, v_wsabuf, v_overlapped);
+ocaml_iocp_recv(value v_sock, value v_wsabuf, value v_overlapped) {
+  CAMLparam3(v_sock, v_wsabuf, v_overlapped);
   DWORD received, flags;
   LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
 
@@ -659,28 +566,34 @@ ocaml_iocp_recv(value v_cp, value v_sock, value v_wsabuf, value v_overlapped) {
   if (i==SOCKET_ERROR) {
       DWORD err = WSAGetLastError();
       if(err == ERROR_IO_PENDING) {
-        // printf("Returned pending\n");
         CAMLreturn0;
       }
       win32_maperr(err);
-      uerror("WSASend", Nothing);
+      uerror("WSARecv", Nothing);
     }
     CAMLreturn0;
 }
 
-value ocaml_iocp_update_accept_ctx(value v_sock) {
-  CAMLparam1(v_sock);
-  BOOL bOptVal = TRUE;
-  int bOptLen = sizeof (BOOL);
-  setsockopt(Socket_val(v_sock), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char *) &bOptVal, bOptLen);
+/* SO_UPDATE_ACCEPT_CONTEXT takes the *listening* socket as its option value. */
+value ocaml_iocp_update_accept_ctx(value v_accept, value v_listen) {
+  CAMLparam2(v_accept, v_listen);
+  SOCKET listen_sock = Socket_val(v_listen);
+  if (setsockopt(Socket_val(v_accept), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                 (char *) &listen_sock, sizeof(listen_sock)) == SOCKET_ERROR) {
+    win32_maperr(WSAGetLastError());
+    uerror("setsockopt", Nothing);
+  }
   CAMLreturn(Val_unit);
 }
 
+/* SO_UPDATE_CONNECT_CONTEXT takes no option value. */
 value ocaml_iocp_update_connect_ctx(value v_sock) {
   CAMLparam1(v_sock);
-  BOOL bOptVal = TRUE;
-  int bOptLen = sizeof (BOOL);
-  setsockopt(Socket_val(v_sock), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, (char *) &bOptVal, bOptLen);
+  if (setsockopt(Socket_val(v_sock), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT,
+                 NULL, 0) == SOCKET_ERROR) {
+    win32_maperr(WSAGetLastError());
+    uerror("setsockopt", Nothing);
+  }
   CAMLreturn(Val_unit);
 }
 
@@ -688,10 +601,113 @@ value ocaml_iocp_cancel(value v_fd, value v_overlapped) {
   CAMLparam2(v_fd, v_overlapped);
   LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
 
-  BOOL b;
-  b = CancelIoEx(Handle_val(v_fd), ol);
-
+  /* The cancelled operation still posts an ERROR_OPERATION_ABORTED completion,
+     which the caller must drain. ERROR_NOT_FOUND just means it already
+     completed, which is not an error here. */
+  if (!CancelIoEx(Handle_val(v_fd), ol)) {
+    DWORD err = GetLastError();
+    if (err != ERROR_NOT_FOUND) {
+      win32_maperr(err);
+      uerror("CancelIoEx", Nothing);
+    }
+  }
   CAMLreturn(Val_unit);
+}
+
+value ocaml_iocp_post(value v_iocp, value v_key, value v_bytes) {
+  CAMLparam3(v_iocp, v_key, v_bytes);
+  BOOL b = PostQueuedCompletionStatus(Handle_val(v_iocp),
+                                      (DWORD)Long_val(v_bytes),
+                                      (ULONG_PTR)Long_val(v_key),
+                                      NULL);
+  if (!b) {
+    win32_maperr(GetLastError());
+    uerror("PostQueuedCompletionStatus", Nothing);
+  }
+  CAMLreturn(Val_unit);
+}
+
+typedef struct iocp_wait_ctx {
+  HANDLE iocp;
+  ULONG_PTR key;
+  HANDLE wait;
+} iocp_wait_ctx;
+
+static VOID CALLBACK iocp_wait_callback(PVOID param, BOOLEAN timedOut) {
+  iocp_wait_ctx *ctx = (iocp_wait_ctx *)param;
+  (void)timedOut;
+  PostQueuedCompletionStatus(ctx->iocp, 0, ctx->key, NULL);
+}
+
+value ocaml_iocp_register_wait(value v_iocp, value v_handle, value v_key) {
+  CAMLparam3(v_iocp, v_handle, v_key);
+  iocp_wait_ctx *ctx = caml_stat_alloc(sizeof(iocp_wait_ctx));
+  ctx->iocp = Handle_val(v_iocp);
+  ctx->key = (ULONG_PTR)Long_val(v_key);
+  ctx->wait = NULL;
+  if (!RegisterWaitForSingleObject(&ctx->wait, Handle_val(v_handle),
+                                   iocp_wait_callback, ctx,
+                                   INFINITE, WT_EXECUTEONLYONCE)) {
+    DWORD err = GetLastError();
+    caml_stat_free(ctx);
+    win32_maperr(err);
+    uerror("RegisterWaitForSingleObject", Nothing);
+  }
+  CAMLreturn(caml_copy_nativeint((intnat)ctx));
+}
+
+value ocaml_iocp_unregister_wait(value v_ctx) {
+  CAMLparam1(v_ctx);
+  iocp_wait_ctx *ctx = (iocp_wait_ctx *)Nativeint_val(v_ctx);
+  if (ctx == NULL) CAMLreturn(Val_unit);   /* already unregistered (defensive) */
+  caml_enter_blocking_section();
+  UnregisterWaitEx(ctx->wait, INVALID_HANDLE_VALUE);
+  caml_leave_blocking_section();
+  caml_stat_free(ctx);
+  CAMLreturn(Val_unit);
+}
+
+void
+ocaml_iocp_recv_from(value v_sock, value v_wsabuf, value v_sockaddr, value v_overlapped) {
+  CAMLparam4(v_sock, v_wsabuf, v_sockaddr, v_overlapped);
+  DWORD received, flags = 0;
+  LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
+  WSABUF *wsabuf = Wsabuf_val(Field(v_wsabuf, 0));
+  int len = Int_val(Field(v_wsabuf, 1));
+  struct sock_addr_data *data = Sock_addr_val(v_sockaddr);
+
+  /* [sock_addr_len] is in/out: initialise it to the buffer capacity. */
+  data->sock_addr_len = sizeof(union sock_addr_union);
+
+  int i = WSARecvFrom(Socket_val(v_sock), wsabuf, len, &received, &flags,
+                      &data->sock_addr_addr.s_gen, &data->sock_addr_len, ol, NULL);
+  if (i == SOCKET_ERROR) {
+    DWORD err = WSAGetLastError();
+    if (err == ERROR_IO_PENDING) CAMLreturn0;
+    win32_maperr(err);
+    uerror("WSARecvFrom", Nothing);
+  }
+  CAMLreturn0;
+}
+
+void
+ocaml_iocp_send_to(value v_sock, value v_wsabuf, value v_sockaddr, value v_overlapped) {
+  CAMLparam4(v_sock, v_wsabuf, v_sockaddr, v_overlapped);
+  DWORD sent;
+  LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
+  WSABUF *wsabuf = Wsabuf_val(Field(v_wsabuf, 0));
+  int len = Int_val(Field(v_wsabuf, 1));
+  struct sock_addr_data *data = Sock_addr_val(v_sockaddr);
+
+  int i = WSASendTo(Socket_val(v_sock), wsabuf, len, &sent, 0,
+                    &data->sock_addr_addr.s_gen, data->sock_addr_len, ol, NULL);
+  if (i == SOCKET_ERROR) {
+    DWORD err = WSAGetLastError();
+    if (err == ERROR_IO_PENDING) CAMLreturn0;
+    win32_maperr(err);
+    uerror("WSASendTo", Nothing);
+  }
+  CAMLreturn0;
 }
 
 static int shutdown_command_table[] = {
@@ -700,7 +716,7 @@ static int shutdown_command_table[] = {
 
 value caml_iocp_shutdown(value v_sock, value cmd)
 {
-  CAMLparam1(v_sock);
+  CAMLparam2(v_sock, cmd);
   if (shutdown(Socket_val(v_sock), shutdown_command_table[Int_val(cmd)]) == -1) {
     win32_maperr(WSAGetLastError());
     uerror("shutdown", Nothing);
@@ -724,9 +740,10 @@ value caml_iocp_shutdown(value v_sock, value cmd)
    DEALINGS IN THE SOFTWARE.
   ---------------------------------------------------------------------------*/
 
-// We need an openfile that passes FILE_FLAGS_OVERLAPPED -- the quickest way
-// was for me to copy the openfile from win32 in ocaml/ocaml... TODO: something
-// better ?
+// We need an openfile that passes FILE_FLAG_OVERLAPPED, which the stdlib's
+// Unix.openfile does not. This is adapted from OCaml's own win32unix open stub
+// (the OCaml runtime sources, win32unix/open.c), with FILE_FLAG_OVERLAPPED set
+// and the resulting handle associated with the completion port.
 
 /**************************************************************************/
 /*                                                                        */
@@ -770,7 +787,7 @@ value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
   CAMLparam4(v_iocp, v_id1, v_id2, v_path);
   CAMLlocal2(readfd, writefd);
   value res;
-  char *wpath = caml_stat_strdup(String_val(v_path));
+  wchar_t *wpath = caml_stat_strdup_to_utf16(String_val(v_path));
   HANDLE iocp = Handle_val(v_iocp);
 
   SECURITY_ATTRIBUTES attr;
@@ -778,8 +795,8 @@ value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
   attr.lpSecurityDescriptor = NULL;
   attr.bInheritHandle = TRUE;
 
-  HANDLE pipeR = CreateNamedPipe(
-        TEXT(wpath), // name of the pipe
+  HANDLE pipeR = CreateNamedPipeW(
+        wpath, // name of the pipe
         (PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED),
         (PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT),
         1, // only allow 1 instance of this pipe
@@ -789,15 +806,14 @@ value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
         &attr // use default security attributes
     );
 
-  caml_stat_free(wpath);
-
   if (pipeR == INVALID_HANDLE_VALUE || pipeR == NULL) {
     win32_maperr(GetLastError());
+    caml_stat_free(wpath);
     uerror("CreateNamedPipe", Nothing);
   }
 
-  HANDLE pipeW = CreateFile(
-        TEXT(wpath),
+  HANDLE pipeW = CreateFileW(
+        wpath,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
@@ -805,26 +821,30 @@ value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
         &attr);
 
+  caml_stat_free(wpath);  /* freed only now: used by both calls above */
+
   if (pipeW == INVALID_HANDLE_VALUE || pipeW == NULL) {
-    printf("Write handle failed\n");
     win32_maperr(GetLastError());
+    CloseHandle(pipeR);
     uerror("CreateNamedPipe", Nothing);
   }
 
-  HANDLE t = CreateIoCompletionPort(pipeR, iocp, v_id1, 0);
+  HANDLE t = CreateIoCompletionPort(pipeR, iocp, (ULONG_PTR)Long_val(v_id1), 0);
 
   if (t == NULL) {
       win32_maperr(GetLastError());
-      // printf("RETURNING FAILED %i\n", GetLastError());
-      uerror("CreateIoCompletionPort1", Nothing);
+      CloseHandle(pipeR);
+      CloseHandle(pipeW);
+      uerror("pipe", Nothing);
     }
 
-  t = CreateIoCompletionPort(pipeW, iocp, v_id2, 0);
+  t = CreateIoCompletionPort(pipeW, iocp, (ULONG_PTR)Long_val(v_id2), 0);
 
   if (t == NULL) {
       win32_maperr(GetLastError());
-      // printf("RETURNING FAILED %i\n", GetLastError());
-      uerror("CreateIoCompletionPort2", Nothing);
+      CloseHandle(pipeR);
+      CloseHandle(pipeW);
+      uerror("pipe", Nothing);
     }
 
   writefd = win_alloc_handle(pipeW);
@@ -838,10 +858,10 @@ value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
 CAMLprim value ocaml_iocp_unix_open(value v_iocp, value v_id, value path, value flags, value perm)
 {
   CAMLparam5(v_iocp, v_id, path, flags, perm);
-  int fileaccess, createflags, fileattrib, filecreate, sharemode, cloexec;
+  int fileaccess, createflags, filecreate, sharemode, cloexec;
   SECURITY_ATTRIBUTES attr;
   HANDLE h;
-  char * wpath;
+  wchar_t * wpath;
 
   HANDLE iocp = Handle_val(v_iocp);
 
@@ -870,17 +890,21 @@ CAMLprim value ocaml_iocp_unix_open(value v_iocp, value v_id, value path, value 
                       : cloexec & KEEPEXEC ? TRUE
                                            : !unix_cloexec_default;
 
-  wpath = caml_stat_strdup(String_val(path));
-  h = CreateFile(wpath, fileaccess,
-                 sharemode, &attr,
-                 filecreate, FILE_FLAG_OVERLAPPED, NULL);
+  wpath = caml_stat_strdup_to_utf16(String_val(path));
+  h = CreateFileW(wpath, fileaccess,
+                  sharemode, &attr,
+                  filecreate, FILE_FLAG_OVERLAPPED, NULL);
   caml_stat_free(wpath);
   if (h == INVALID_HANDLE_VALUE) {
     win32_maperr(GetLastError());
     uerror("open", path);
   }
 
-  CreateIoCompletionPort(h, iocp, v_id, 0);
+  if (CreateIoCompletionPort(h, iocp, (ULONG_PTR)Long_val(v_id), 0) == NULL) {
+    win32_maperr(GetLastError());
+    CloseHandle(h);
+    uerror("CreateIoCompletionPort", Nothing);
+  }
 
   CAMLreturn(win_alloc_handle(h));
 }

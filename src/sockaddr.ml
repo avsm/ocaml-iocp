@@ -1,5 +1,5 @@
 (*
- * Copyright (C) 2020-2021 Anil Madhavapeddy
+ * Copyright (C) 2020-2026 Anil Madhavapeddy
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -21,3 +21,15 @@ external get : t -> Unix.sockaddr = "ocaml_iocp_extract_sockaddr"
 
 let dummy_addr = Unix.ADDR_UNIX "-"
 let create () = of_unix dummy_addr
+
+external accept_buffer_size : unit -> int = "ocaml_iocp_accept_buffer_size"
+
+let accept_buffer () = Cstruct.create (accept_buffer_size ())
+
+external get_accept_ex_sockaddr : Cstruct.buffer -> Handle.t -> t -> unit
+  = "ocaml_iocp_get_accept_ex_sockaddr"
+
+let of_accept_buffer buf ~listen =
+  let s = create () in
+  get_accept_ex_sockaddr (Cstruct.to_bigarray buf) listen s;
+  s
