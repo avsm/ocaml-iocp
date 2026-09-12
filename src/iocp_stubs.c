@@ -257,6 +257,15 @@ value ocaml_iocp_associate_fd_with_iocp(value v_iocp, value v_fd, value v_key) {
     CAMLreturn(v_fd);
 
 }
+/* Ask for no completion packet when an operation finishes without going
+   pending, so its result can be taken from the submitting call. False if the
+   handle refuses, in which case it still posts a packet for everything. */
+value ocaml_iocp_set_skip_completion_on_success(value v_fd) {
+    CAMLparam1(v_fd);
+    CAMLreturn(Val_bool(SetFileCompletionNotificationModes(
+                          Handle_val(v_fd), FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)));
+}
+
 value ocaml_iocp_get_queued_completion_status(value v_fd, value v_timeout) {
     CAMLparam2(v_fd, v_timeout);
     CAMLlocal3(v,v_err,v_code);
@@ -418,14 +427,16 @@ value ocaml_iocp_read(value v_fd, value v_ba, value v_num_bytes, value v_off, va
     check_bounds(v_ba, v_off, v_num_bytes, "Iocp.read: buffer too small");
     buf = Caml_ba_data_val(v_ba) + Long_val(v_off);
     b = ReadFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
-    // FALSE with ERROR_IO_PENDING just means the op is running asynchronously.
+    /* Returns -1 if the operation went pending and a packet will arrive for it,
+       otherwise the number of bytes it already transferred. FALSE with
+       ERROR_IO_PENDING is the pending case. */
     if (!b) {
       DWORD err = GetLastError();
-      if(err == ERROR_IO_PENDING) CAMLreturn(Val_unit);
+      if(err == ERROR_IO_PENDING) CAMLreturn(Val_int(-1));
       win32_maperr(err);
       uerror("ReadFile", Nothing);
     }
-    CAMLreturn(Val_unit);
+    CAMLreturn(Val_int((intnat)ol->InternalHigh));
 }
 
 value ocaml_iocp_write(value v_fd, value v_ba, value v_num_bytes, value v_off, value v_overlapped) {
@@ -438,11 +449,11 @@ value ocaml_iocp_write(value v_fd, value v_ba, value v_num_bytes, value v_off, v
     b = WriteFile(Handle_val(v_fd), buf, Int_val(v_num_bytes), NULL, ol);
     if (!b) {
       DWORD err = GetLastError();
-      if(err == ERROR_IO_PENDING) CAMLreturn(Val_unit);
+      if(err == ERROR_IO_PENDING) CAMLreturn(Val_int(-1));
       win32_maperr(err);
       uerror("WriteFile", Nothing);
     }
-    CAMLreturn(Val_unit);
+    CAMLreturn(Val_int((intnat)ol->InternalHigh));
 }
 
 GUID GuidGetAddrAcceptEx = WSAID_GETACCEPTEXSOCKADDRS;
@@ -513,7 +524,7 @@ static LPFN_ACCEPTEX get_accept_ex(SOCKET s) {
     return fn;
 }
 
-void ocaml_iocp_accept(value v_listen, value v_accept, value v_accept_buffer, value v_overlapped) {
+value ocaml_iocp_accept(value v_listen, value v_accept, value v_accept_buffer, value v_overlapped) {
     CAMLparam4(v_listen, v_accept, v_accept_buffer, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
     DWORD received;
@@ -541,12 +552,12 @@ void ocaml_iocp_accept(value v_listen, value v_accept, value v_accept_buffer, va
     if (!b) {
       DWORD err = WSAGetLastError();
       if(err == ERROR_IO_PENDING) {
-        CAMLreturn0;
+        CAMLreturn(Val_int(-1));
       }
       win32_maperr(err);
       uerror("AcceptEx", Nothing);
     }
-    CAMLreturn0;
+    CAMLreturn(Val_int(received));
 }
 
 GUID GuidConnectEx = WSAID_CONNECTEX;
@@ -563,7 +574,7 @@ static LPFN_CONNECTEX get_connect_ex(SOCKET s) {
     return fn;
 }
 
-void ocaml_iocp_connect(value v_sock, value v_addr, value v_overlapped) {
+value ocaml_iocp_connect(value v_sock, value v_addr, value v_overlapped) {
     CAMLparam3(v_sock, v_addr, v_overlapped);
     LPOVERLAPPED ol = overlapped_ptr_of_val(Field(v_overlapped,0));
     DWORD received;
@@ -591,18 +602,18 @@ void ocaml_iocp_connect(value v_sock, value v_addr, value v_overlapped) {
     if (!b) {
       DWORD err = GetLastError();
       if(err == ERROR_IO_PENDING) {
-        CAMLreturn0;
+        CAMLreturn(Val_int(-1));
       }
       win32_maperr(err);
       uerror("ConnectEx", Nothing);
     }
-    CAMLreturn0;
+    CAMLreturn(Val_int(0));
 }
 
 // WSABUF
 
 
-void
+value
 ocaml_iocp_send(value v_sock, value v_wsabuf, value v_overlapped) {
   CAMLparam3(v_sock, v_wsabuf, v_overlapped);
   DWORD received;
@@ -624,15 +635,15 @@ ocaml_iocp_send(value v_sock, value v_wsabuf, value v_overlapped) {
   if (i==SOCKET_ERROR) {
       DWORD err = WSAGetLastError();
       if(err == ERROR_IO_PENDING) {
-        CAMLreturn0;
+        CAMLreturn(Val_int(-1));
       }
       win32_maperr(err);
       uerror("WSASend", Nothing);
     }
-    CAMLreturn0;
+    CAMLreturn(Val_int(received));
 }
 
-void
+value
 ocaml_iocp_recv(value v_sock, value v_wsabuf, value v_overlapped) {
   CAMLparam3(v_sock, v_wsabuf, v_overlapped);
   DWORD received, flags;
@@ -657,12 +668,12 @@ ocaml_iocp_recv(value v_sock, value v_wsabuf, value v_overlapped) {
   if (i==SOCKET_ERROR) {
       DWORD err = WSAGetLastError();
       if(err == ERROR_IO_PENDING) {
-        CAMLreturn0;
+        CAMLreturn(Val_int(-1));
       }
       win32_maperr(err);
       uerror("WSARecv", Nothing);
     }
-    CAMLreturn0;
+    CAMLreturn(Val_int(received));
 }
 
 /* SO_UPDATE_ACCEPT_CONTEXT takes the *listening* socket as its option value. */
@@ -774,7 +785,7 @@ value ocaml_iocp_unregister_wait(value v_ctx) {
   CAMLreturn(Val_unit);
 }
 
-void
+value
 ocaml_iocp_recv_from(value v_sock, value v_wsabuf, value v_sockaddr, value v_overlapped) {
   CAMLparam4(v_sock, v_wsabuf, v_sockaddr, v_overlapped);
   DWORD received, flags = 0;
@@ -790,14 +801,14 @@ ocaml_iocp_recv_from(value v_sock, value v_wsabuf, value v_sockaddr, value v_ove
                       &data->sock_addr_addr.s_gen, &data->sock_addr_len, ol, NULL);
   if (i == SOCKET_ERROR) {
     DWORD err = WSAGetLastError();
-    if (err == ERROR_IO_PENDING) CAMLreturn0;
+    if (err == ERROR_IO_PENDING) CAMLreturn(Val_int(-1));
     win32_maperr(err);
     uerror("WSARecvFrom", Nothing);
   }
-  CAMLreturn0;
+  CAMLreturn(Val_int(received));
 }
 
-void
+value
 ocaml_iocp_send_to(value v_sock, value v_wsabuf, value v_sockaddr, value v_overlapped) {
   CAMLparam4(v_sock, v_wsabuf, v_sockaddr, v_overlapped);
   DWORD sent;
@@ -810,11 +821,11 @@ ocaml_iocp_send_to(value v_sock, value v_wsabuf, value v_sockaddr, value v_overl
                     &data->sock_addr_addr.s_gen, data->sock_addr_len, ol, NULL);
   if (i == SOCKET_ERROR) {
     DWORD err = WSAGetLastError();
-    if (err == ERROR_IO_PENDING) CAMLreturn0;
+    if (err == ERROR_IO_PENDING) CAMLreturn(Val_int(-1));
     win32_maperr(err);
     uerror("WSASendTo", Nothing);
   }
-  CAMLreturn0;
+  CAMLreturn(Val_int(sent));
 }
 
 static int shutdown_command_table[] = {

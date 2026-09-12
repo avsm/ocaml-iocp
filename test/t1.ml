@@ -7,7 +7,7 @@ let pipe () =
   let buf = Cstruct.of_string s in
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let ol_id = Iocp.Overlapped.id ol in
-  let () =
+  let (_ : int) =
     Iocp.Raw.write wfd (Cstruct.to_bigarray buf) (String.length s) 0 ol
   in
   match Iocp.Raw.get_queued_completion_status iocp 1000 with
@@ -17,7 +17,7 @@ let pipe () =
       assert (t.bytes_transferred = String.length s);
       assert (ol_id = ol_id');
       let buf' = Cstruct.create t.bytes_transferred in
-      let () =
+      let (_ : int) =
         Iocp.Raw.read rfd (Cstruct.to_bigarray buf') t.bytes_transferred 0
           ol
       in
@@ -36,7 +36,7 @@ let cancel () =
   let buf' = Cstruct.create 100 in
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let ol_id = Iocp.Overlapped.id ol in
-  let () =
+  let (_ : int) =
     Iocp.Raw.read rfd (Cstruct.to_bigarray buf') 100 0
       ol
   in
@@ -59,7 +59,7 @@ let write_read () =
   in
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let buf = Cstruct.of_string "Test data" in
-  let () =
+  let (_ : int) =
     Iocp.Raw.write handle (Cstruct.to_bigarray buf) (Cstruct.length buf) 0
       ol
   in
@@ -68,7 +68,7 @@ let write_read () =
   | _ -> ());
   let buf2 = Cstruct.create (Cstruct.length buf) in
   let ol2 = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
-  let () =
+  let (_ : int) =
     Iocp.Raw.read handle (Cstruct.to_bigarray buf2) (Cstruct.length buf) 0
       ol2
   in
@@ -129,7 +129,7 @@ let multicore_read max () =
     List.init n (fun _ ->
         let read_buf = Cstruct.create (String.length s) in
         let ol = Iocp.Overlapped.create () in
-        let () =
+        let (_ : int) =
           Iocp.Raw.read rfd
             (Cstruct.to_bigarray read_buf)
             (String.length s) 0 ol
@@ -176,7 +176,7 @@ let multicore_read max () =
   in
 
   let domains = List.init m (fun _ -> Format.eprintf "spawning domain\n%!"; Domain.spawn thread_body) in
-  List.iter (fun w -> dispatch_write w) writes;
+  List.iter (fun w -> ignore (dispatch_write w : int)) writes;
   List.iter (fun d -> Domain.join d) domains;
   Format.eprintf "max_concurrency=%d max=%d\n" !max_concurrency max
   (* assert (!max_concurrency <= max+1) *)
@@ -202,7 +202,7 @@ let multicore_read_unsafe () =
     List.init n (fun _ ->
         let read_buf = Cstruct.create (String.length s) in
         let ol = Iocp.Overlapped.create () in
-        let () =
+        let (_ : int) =
           Iocp.Raw.read rfd
             (Cstruct.to_bigarray read_buf)
             (String.length s) 0 ol
@@ -251,7 +251,7 @@ let multicore_read_unsafe () =
   in
 
   let domains = List.init m (fun _ -> Domain.spawn thread_body) in
-  List.iter (fun w -> dispatch_write w) writes;
+  List.iter (fun w -> ignore (dispatch_write w : int)) writes;
   List.iter (fun d -> Domain.join d) domains
 
 (* Check for error from a completed async request *)
@@ -264,7 +264,7 @@ let error_out_of_bounds () =
   let handle = Iocp.Raw.openfile iocp 1 filename Unix.[ O_RDONLY ] 0 in
   let buf = Cstruct.create 1 in
   let ol = Iocp.Overlapped.create ~off:(Optint.Int63.of_int 1024) () in
-  let () = Iocp.Raw.read handle (Cstruct.to_bigarray buf) 1 0 ol in
+  let (_ : int) = Iocp.Raw.read handle (Cstruct.to_bigarray buf) 1 0 ol in
   match Iocp.Raw.get_queued_completion_status iocp 1000 with
   | Cs_none -> assert false
   | Cs_some t -> ( match t.error with None -> assert false | Some _e -> ())

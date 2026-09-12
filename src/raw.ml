@@ -8,6 +8,9 @@ type id = int
 external create_io_completion_port : int -> t
   = "ocaml_iocp_create_io_completion_port"
 
+external set_skip_completion_on_success : Handle.t -> bool
+  = "ocaml_iocp_set_skip_completion_on_success"
+
 external close_io_completion_port : t -> unit
   = "ocaml_iocp_close_io_completion_port"
 
@@ -67,36 +70,36 @@ let make_unsafe_completion_status () =
 (* Operations. The handle is already associated with a completion port, so these
    don't take the port — completions are delivered to the associated port. *)
 external read :
-  Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> unit
+  Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> int
   = "ocaml_iocp_read"
 
 external write :
-  Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> unit
+  Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> int
   = "ocaml_iocp_write"
 
 external accept :
-  Handle.t -> Handle.t  -> Cstruct.buffer -> 'a Overlapped.t -> unit
+  Handle.t -> Handle.t -> Cstruct.buffer -> 'a Overlapped.t -> int
   = "ocaml_iocp_accept"
 
 external connect :
-  Handle.t -> Sockaddr.t -> 'a Overlapped.t -> unit
+  Handle.t -> Sockaddr.t -> 'a Overlapped.t -> int
   = "ocaml_iocp_connect"
 
-external send : Handle.t -> Cstruct.t list -> 'a Overlapped.t -> unit
+external send : Handle.t -> Cstruct.t list -> 'a Overlapped.t -> int
   = "ocaml_iocp_send"
 
-external recv : Handle.t -> Cstruct.t list  -> 'a Overlapped.t -> unit
+external recv : Handle.t -> Cstruct.t list -> 'a Overlapped.t -> int
   = "ocaml_iocp_recv"
 
 external cancel : Handle.t -> 'a Overlapped.t -> unit = "ocaml_iocp_cancel"
 external cancel_all : Handle.t -> unit = "ocaml_iocp_cancel_all"
 
 external recv_from :
-  Handle.t -> Cstruct.t list -> Sockaddr.t -> 'a Overlapped.t -> unit
+  Handle.t -> Cstruct.t list -> Sockaddr.t -> 'a Overlapped.t -> int
   = "ocaml_iocp_recv_from"
 
 external send_to :
-  Handle.t -> Cstruct.t list -> Sockaddr.t -> 'a Overlapped.t -> unit
+  Handle.t -> Cstruct.t list -> Sockaddr.t -> 'a Overlapped.t -> int
   = "ocaml_iocp_send_to"
 
 (* Post a key-only completion packet (no OVERLAPPED); used for wakeups and to

@@ -40,6 +40,14 @@ type t = {
   batch : int array;
   mutable batch_len : int;
   mutable batch_pos : int;
+
+  (* Operations that finished without going pending, so no packet is coming for
+     them; {!wait} hands these out before asking the port for more. *)
+  done_inline : (Id.t * int) Queue.t;
+
+  (* Handles that refused the skip mode and so still post a packet for
+     everything. Normally empty. *)
+  no_skip : (Unix.file_descr, unit) Hashtbl.t;
 }
 
 (* Asking for more makes the single-ready-packet case measurably slower without
@@ -60,9 +68,17 @@ type packet =
   | Posted of { key : int; bytes_transferred : int }
 
 let handle_of_fd v fd key =
-  Raw.associate_fd_with_iocp v.iocp fd key
+  let h = Raw.associate_fd_with_iocp v.iocp fd key in
+  (* Ask the handle to stop posting a packet for work it finishes immediately.
+     Not every kind of handle allows it; remember the ones that don't. *)
+  if not (Raw.set_skip_completion_on_success h) then Hashtbl.replace v.no_skip fd ();
+  h
 
-let openfile t = Raw.openfile t.iocp
+let openfile v key path flags perm =
+  let h = Raw.openfile v.iocp key path flags perm in
+  if not (Raw.set_skip_completion_on_success h) then
+    Hashtbl.replace v.no_skip (Handle.fd h) ();
+  h
 
 let get_overlapped v fd root =
   match v.free with
@@ -82,15 +98,21 @@ let release v id =
   | None -> ()
   | Some (_, ol, _) -> H.remove v.in_flight id; v.free <- ol :: v.free
 
-(* Take a slot from the pool and start an operation on it. If [start] raises the
-   operation never went pending, so no completion will arrive to release the slot
-   and it has to go back here. *)
+(* Take a slot from the pool and start an operation on it.
+
+   If [start] raises the operation never went pending, so no completion will
+   arrive to release the slot and it has to go back here. Otherwise it returns
+   -1 for pending, or the bytes already transferred — a handle in skip mode
+   posts no packet for the latter, so the result is kept for {!wait}. *)
 let submit v fd root start =
   match get_overlapped v fd root with
   | None -> None
   | Some (ol, id) ->
     match start ol with
-    | () -> Some id
+    | n ->
+      if n >= 0 && not (Hashtbl.mem v.no_skip (Handle.fd fd)) then
+        Queue.add (id, n) v.done_inline;
+      Some id
     | exception ex -> release v id; raise ex
 
 let read v fd buf ~pos ~len ~off =
@@ -103,7 +125,14 @@ let write v fd buf ~pos ~len ~off =
       Overlapped.set_offset ol off;
       Raw.write fd buf len pos ol)
 
-(* Turn the [i]th dequeued packet into a result, recycling its slot. *)
+(* Release [id]'s slot and describe its completion. *)
+let io_of v id bytes_transferred error =
+  (match H.find_opt v.in_flight id with
+   | Some (_, ol, _) -> H.remove v.in_flight id; v.free <- ol :: v.free
+   | None -> ());
+  Io { bytes_transferred; id; error }
+
+(* Turn the [i]th dequeued packet into a result. *)
 let packet_of_batch v i =
   let key = v.batch.(i * 4)
   and bytes_transferred = v.batch.((i * 4) + 1)
@@ -112,26 +141,24 @@ let packet_of_batch v i =
   if overlapped_id = 0 then
     (* No OVERLAPPED: a packet posted by [post]/[wakeup] or a registered wait. *)
     Posted { key; bytes_transferred }
-  else begin
-    let id = Overlapped.unsafe_key overlapped_id in
-    (match H.find_opt v.in_flight id with
-     | Some (_, ol, _) -> H.remove v.in_flight id; v.free <- ol :: v.free
-     | None -> ());
+  else
     let error = if err = 0 then None else Some (Raw.unix_error_of_win32 err) in
-    Io { bytes_transferred; id; error }
-  end
+    io_of v (Overlapped.unsafe_key overlapped_id) bytes_transferred error
 
 let wait v ~timeout =
-  if v.batch_pos >= v.batch_len then begin
-    v.batch_pos <- 0;
-    v.batch_len <- Raw.get_queued_completion_status_ex v.iocp timeout v.batch
-  end;
-  if v.batch_len = 0 then None
-  else begin
-    let p = packet_of_batch v v.batch_pos in
-    v.batch_pos <- v.batch_pos + 1;
-    Some p
-  end
+  match Queue.take_opt v.done_inline with
+  | Some (id, n) -> Some (io_of v id n None)
+  | None ->
+    if v.batch_pos >= v.batch_len then begin
+      v.batch_pos <- 0;
+      v.batch_len <- Raw.get_queued_completion_status_ex v.iocp timeout v.batch
+    end;
+    if v.batch_len = 0 then None
+    else begin
+      let p = packet_of_batch v v.batch_pos in
+      v.batch_pos <- v.batch_pos + 1;
+      Some p
+    end
 
 let active_ops v = H.length v.in_flight
 
@@ -205,7 +232,9 @@ let create ?(overlapped = 1024) n =
     ; closed = false
     ; batch = Array.make (batch_entries * 4) 0
     ; batch_len = 0
-    ; batch_pos = 0 }
+    ; batch_pos = 0
+    ; done_inline = Queue.create ()
+    ; no_skip = Hashtbl.create 4 }
   in
   Gc.finalise close v;
   v
