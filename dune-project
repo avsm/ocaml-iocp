@@ -13,5 +13,4 @@
    cstruct
    optint
    (mdx :with-test)
-   (alcotest :with-test)
-   (bechamel (and (>= 0.4.0) :with-test))))
+   (alcotest :with-test)))

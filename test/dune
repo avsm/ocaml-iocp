@@ -4,11 +4,6 @@
  (libraries iocp copy_lib))
 
 (library
- (name lwtcp_lib)
- (modules lwtcp_lib)
- (libraries lwt.unix logs))
-
-(library
  (name copy_lib)
  (modules copy_lib)
  (libraries iocp))
@@ -29,14 +24,3 @@
  (alias runtest)
  (action
   (run ./t1.exe)))
-
-(executable
- (name cptest)
- (modules cptest)
- (libraries lwtcp_lib copy_lib bechamel bechamel.monotonic_clock bechamel_csv))
-
-(rule
- (alias runbenchmark)
- (action
-  (run ./cptest.exe)))
-
