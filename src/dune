@@ -1,8 +1,9 @@
 (library
  (name iocp)
  (public_name iocp)
+ (modules iocp raw)
+ (private_modules raw)
  (enabled_if (= %{os_type} "Win32"))
- (libraries unix cstruct optint threads)
- (foreign_stubs
-  (language c)
-  (names iocp_stubs)))
+ (libraries unix cstruct threads)
+ (foreign_stubs (language c) (names iocp_stubs))
+ (c_library_flags -lws2_32 -lbcrypt -lntdll))

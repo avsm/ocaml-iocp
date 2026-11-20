@@ -1,22 +1,17 @@
-(executable
- (name copy)
- (modules copy)
- (libraries iocp copy_lib))
-
-(library
- (name copy_lib)
- (modules copy_lib)
- (libraries iocp))
-
-(rule
- (alias runtest)
- (deps ./test.md)
- (target ./test.out)
- (action
-  (run ./copy.exe ./test.md ./test.out)))
-
+(copy_files ../src/raw.ml)
 
 (test
  (name test_iocp)
- (modules test_iocp)
- (libraries iocp alcotest))
+ (modules test_iocp raw)
+ (modes byte byte_complete exe)
+ (deps ../src/dlliocp_stubs.dll)
+ (action
+  (setenv CAML_LD_LIBRARY_PATH "../src;%{env:CAML_LD_LIBRARY_PATH=}"
+   (run %{test})))
+ (libraries iocp alcotest)
+ (enabled_if (= %{os_type} "Win32")))
+
+(rule
+ (alias runtest)
+ (enabled_if (= %{os_type} "Win32"))
+ (action (run ./test_iocp.bc.exe)))
