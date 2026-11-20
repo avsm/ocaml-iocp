@@ -1,13 +1,38 @@
 (* Copyright (c) 2026 Anil Madhavapeddy <anil@recoil.org>
    SPDX-License-Identifier: MIT *)
 
-(** Windows completion ports and borrowed handle registrations. *)
+(** Windows I/O completion ports.
+
+    A port delivers completions for operations on registered files and pipes.
+    Threads and domains may submit and cancel requests concurrently. Each port
+    admits one caller of {!wait} at a time.
+
+    {1:delivery Completion delivery}
+
+    Give each outstanding operation a positive ID and use the ID to dispatch its
+    completion. Completions may arrive in any order. The port queues one
+    completion per successful submission.
+
+    {1:lifetime Ownership and shutdown}
+
+    The caller owns the descriptor. A {!handle} borrows it until {!close_handle}
+    returns. The library keeps submitted buffers reachable. Keep each submitted
+    byte range, including overlapping slices, untouched until its completion is
+    delivered. At that point the range and ID may be reused.
+
+    To shut down a port, stop new submissions, request cancellation if needed,
+    and drain outstanding completions. Close each registration, then close the
+    port. Close the underlying descriptors separately. *)
 
 type t
-(** A completion port. *)
+(** A completion port and its outstanding requests. *)
 
 type handle
 (** A borrowed registration of an overlapped handle with a port. *)
+
+type request
+(** A submission token for {!cancel}. It may be discarded while the port is
+    awaiting its completion. *)
 
 type completion = {
   id : int;  (** Identifies the request, or is zero for a notification. *)
@@ -25,7 +50,12 @@ val create : unit -> t
 
 val close : t -> unit
 (** Close the port. Repeated calls have no effect. Raise [Invalid_argument] if a
-    consumer is waiting or registrations remain open. *)
+    consumer is waiting, requests remain pending or registrations remain open.
+*)
+
+val pending : t -> int
+(** Return the number of requests still awaiting delivery through {!wait},
+    including I/O still in progress. Wake notifications are excluded. *)
 
 val register : t -> Unix.file_descr -> handle
 (** [register port fd] borrows an overlapped descriptor. Keep [fd] open and
@@ -39,7 +69,8 @@ val register : t -> Unix.file_descr -> handle
     operations exclusively through this library, including through aliases. *)
 
 val close_handle : handle -> unit
-(** Close a registration. Repeated calls have no effect. Closing the last
+(** Close a registration. Repeated calls have no effect. Raise
+    [Invalid_argument] while its requests remain pending. Closing the last
     registration detaches the object from the port, allowing later registration
     with another port. The original descriptor remains open and belongs to the
     caller. *)
@@ -55,3 +86,30 @@ val wait : t -> timeout:int -> completion option
     timeouts must not exceed [0xffff_fffe]. Sequential calls may use different
     OS threads. If constructing the completion raises [Out_of_memory], retry
     [wait] to collect the same packet. *)
+
+val cancel : t -> request -> unit
+(** Request cancellation. Cancellation may race with successful completion. A
+    pending request still requires a delivery through {!wait}. Cancelling a
+    completed request has no effect. Raise [Invalid_argument] if the request
+    belongs to another port. *)
+
+val cancel_all : t -> unit
+(** Request cancellation of all pending operations. Drain them with {!wait}
+    before closing the port. *)
+
+(** {1 I/O operations}
+
+    Use the port that owns the registration. A closed registration, the wrong
+    port, a non-positive ID or an outstanding duplicate ID raises
+    [Invalid_argument]. A Windows error during submission may raise
+    [Unix.Unix_error] directly. In that case there is no completion to drain.
+    For a returned request, inspect the [error] field on delivery. *)
+
+val read : t -> id:int -> handle -> Cstruct.t -> offset:int64 -> request
+(** Read into the buffer at the given file offset. Use a non-negative offset for
+    files and [0L] for pipes. End of input completes successfully with zero
+    bytes. *)
+
+val write : t -> id:int -> handle -> Cstruct.t -> offset:int64 -> request
+(** Write from the buffer at the given file offset. Use a non-negative offset
+    for files, [-1L] for atomic append, and [0L] for pipes. *)
