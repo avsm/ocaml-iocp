@@ -170,6 +170,87 @@ let wake () =
   success p 0 0;
   Domain.join d
 
+let sockets () =
+  let listener = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+  let client = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+  let accepted = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+  Fun.protect ~finally:(fun () ->
+      List.iter close_fd [ listener; client; accepted ])
+  @@ fun () ->
+  Unix.bind listener (ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listener 1;
+  Unix.bind client (ADDR_INET (Unix.inet_addr_any, 0));
+  with_port @@ fun p ->
+  ignore (Iocp.accept p ~id:1 (handle p listener) ~client:accepted);
+  ignore (Iocp.connect p ~id:2 (handle p client) (Unix.getsockname listener));
+  let a = status p and b = status p in
+  check "ids" 3 (a.id + b.id);
+  assert (a.error = None && b.error = None);
+  assert (Unix.getpeername client = Unix.getsockname listener);
+  ignore (Unix.getpeername accepted);
+  let buf = Cstruct.create 5 in
+  ignore (Iocp.recv p ~id:3 (handle p accepted) buf);
+  ignore (Iocp.send p ~id:4 (handle p client) (Cstruct.of_string "hello"));
+  let a = status p and b = status p in
+  assert (a.error = None && b.error = None);
+  check "bytes" 10 (a.bytes_transferred + b.bytes_transferred);
+  Alcotest.(check string) "socket contents" "hello" (Cstruct.to_string buf)
+
+let refused () =
+  let reserved = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+  let client = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+  Fun.protect ~finally:(fun () ->
+      close_fd client;
+      close_fd reserved)
+  @@ fun () ->
+  Unix.bind reserved (ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.bind client (ADDR_INET (Unix.inet_addr_any, 0));
+  with_port @@ fun p ->
+  match Iocp.connect p ~id:1 (handle p client) (Unix.getsockname reserved) with
+  | _ ->
+      let c = status p in
+      if c.error <> Some Unix.ECONNREFUSED then
+        Alcotest.fail
+          (match c.error with
+          | None -> "unexpected success"
+          | Some e -> Printexc.to_string (Unix.Unix_error (e, "connect", "")))
+  | exception Unix.Unix_error (ECONNREFUSED, _, _) -> ()
+
+let receive_shutdown ~duplicate () =
+  let a, b = Unix.socketpair ~cloexec:true PF_UNIX SOCK_STREAM 0 in
+  Fun.protect ~finally:(fun () ->
+      close_fd a;
+      close_fd b)
+  @@ fun () ->
+  let other_a, other_b = Unix.socketpair ~cloexec:true PF_UNIX SOCK_STREAM 0 in
+  Fun.protect ~finally:(fun () ->
+      close_fd other_a;
+      close_fd other_b)
+  @@ fun () ->
+  with_port @@ fun p ->
+  ignore (Iocp.recv p ~id:1 (handle p a) (Cstruct.create 1));
+  let other = Iocp.recv p ~id:2 (handle p other_a) (Cstruct.create 1) in
+  if duplicate then
+    let alias = Unix.dup ~cloexec:true a in
+    Fun.protect
+      ~finally:(fun () -> close_fd alias)
+      (fun () -> Iocp.shutdown p (handle p alias) Unix.SHUTDOWN_RECEIVE)
+  else Iocp.shutdown p (handle p a) Unix.SHUTDOWN_RECEIVE;
+  let c = status p in
+  (match c.error with
+  | None -> ()
+  | Some e ->
+      Alcotest.fail
+        (Printexc.to_string (Unix.Unix_error (e, "shutdown read", ""))));
+  check "shutdown request" 1 c.id;
+  check "EOF" 0 c.bytes_transferred;
+  assert (Iocp.wait p ~timeout:0 = None);
+  check "unrelated receive remains pending" 1 (Iocp.pending p);
+  Iocp.cancel p other;
+  let c = status p in
+  check "unrelated request" 2 c.id;
+  assert (c.error <> None)
+
 (* Model a failure while converting a dequeued packet, before delivery commits. *)
 let retry_delivery () =
   let p = Raw.create_port () in
@@ -185,7 +266,7 @@ let retry_delivery () =
   let op = Raw.allocate p 1 wr buf Raw.Native_queue in
   ignore (Raw.submit_buffer op Raw.Write_file buf 0L);
   check "first delivery" 1 (Raw.dequeue p 10000);
-  let first = Raw.completion op in
+  let first = Raw.completion op false in
   assert (
     match first with
     | Some c -> c.id = 1 && c.bytes_transferred = 1 && c.error = None
@@ -193,7 +274,7 @@ let retry_delivery () =
   Raw.wake_port p;
   Gc.compact ();
   check "retry the same packet" 1 (Raw.dequeue p 0);
-  assert (Raw.completion op = first);
+  assert (Raw.completion op false = first);
   Raw.acknowledge p;
   check "next packet" 0 (Raw.dequeue p 0);
   Raw.acknowledge p;
@@ -272,6 +353,23 @@ let wrong_port () =
   with_port @@ fun other ->
   let request = Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L in
   invalid (fun () -> Iocp.cancel other request)
+
+let cancel_accept () =
+  let listener = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+  let client = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+  Fun.protect ~finally:(fun () ->
+      close_fd listener;
+      close_fd client)
+  @@ fun () ->
+  Unix.bind listener (ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listener 1;
+  with_port @@ fun p ->
+  let r = Iocp.accept p ~id:1 (handle p listener) ~client in
+  Gc.full_major ();
+  Iocp.cancel p r;
+  let c = status p in
+  check "cancelled accept ID" 1 c.id;
+  assert (c.error <> None)
 
 let append_access () =
   let path = Filename.temp_file "iocp-append" ".tmp" in
@@ -613,12 +711,15 @@ let () =
             ("cancel blocked pipe write", cancel_write);
             ("pipe EOF", pipe_eof);
             ("append preserves access", append_access);
+            ("cancel accept", cancel_accept);
             ("cancellation race", cancel_race);
             ("cross-domain submission", cross_domain_submit);
             ("closed port", closed_port);
             ("wrong-port cancellation", wrong_port);
             ("sequential consumer handover", consumer_handover);
             ("retry unacknowledged delivery", retry_delivery);
+            ("receive shutdown", receive_shutdown ~duplicate:false);
+            ("receive shutdown through dup", receive_shutdown ~duplicate:true);
             ("file and 64-bit offset", file);
             ("pipe", pipe);
             ("cancel and GC", cancel_gc);
@@ -627,5 +728,7 @@ let () =
             ("submission rollback", submission_failure);
             ("more than 1024 requests", many_requests);
             ("cross-domain wake", wake);
+            ("accept/connect/send/recv", sockets);
+            ("connection refusal", refused);
           ] );
     ]

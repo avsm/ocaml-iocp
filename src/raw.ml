@@ -26,7 +26,7 @@ external dequeue : port -> int -> int = "iocp_dequeue"
     [acknowledge] commits delivery. Both functions require the consumer lock. *)
 
 external acknowledge : port -> unit = "iocp_acknowledge" [@@noalloc]
-external completion : operation -> completion option = "iocp_completion"
+external completion : operation -> bool -> completion option = "iocp_completion"
 
 type delivery = Native_queue | Post_queue | Immediate
 
@@ -34,10 +34,16 @@ external allocate :
   port -> int -> Unix.file_descr -> 'a -> delivery -> operation
   = "iocp_allocate"
 
-type buffer_op = Read_file | Write_file
+type buffer_op = Read_file | Write_file | Recv | Send
 
 external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> bool
   = "iocp_submit_buffer"
+
+external submit_accept : operation -> Unix.file_descr -> bool
+  = "iocp_submit_accept"
+
+external submit_connect : operation -> Unix.sockaddr -> bool
+  = "iocp_submit_connect"
 
 external cancel_operation : operation -> unit = "iocp_cancel"
 

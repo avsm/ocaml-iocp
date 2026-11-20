@@ -38,6 +38,8 @@ and request = {
   id : int;
   owner : Raw.port;
   handle : handle;
+  receive : bool;
+  mutable eof_on_cancel : bool;
   mutable immediate : bool;
 }
 
@@ -154,13 +156,13 @@ let wait t ~timeout =
   | id ->
       locked t (fun () ->
           let r = Hashtbl.find t.requests id in
-          let result = Raw.completion r.operation in
+          let result = Raw.completion r.operation r.eof_on_cancel in
           Hashtbl.remove t.requests id;
           r.handle.pending <- r.handle.pending - 1;
           Raw.acknowledge t.port;
           result)
 
-let submit t ~id h roots fn =
+let submit ?(receive = false) t ~id h roots fn =
   locked t (fun () ->
       check_handle t h;
       if id <= 0 || Hashtbl.mem t.requests id then
@@ -180,7 +182,15 @@ let submit t ~id h roots fn =
       in
       let operation = Raw.allocate t.port id h.fd (h, roots) delivery in
       let r =
-        { operation; id; owner = t.port; handle = h; immediate = false }
+        {
+          operation;
+          id;
+          owner = t.port;
+          handle = h;
+          receive;
+          eof_on_cancel = false;
+          immediate = false;
+        }
       in
       h.pending <- h.pending + 1;
       match
@@ -198,15 +208,24 @@ let submit t ~id h roots fn =
           Hashtbl.remove t.requests id;
           raise ex)
 
-let result r = if r.immediate then Raw.completion r.operation else None
+let result r = if r.immediate then Raw.completion r.operation false else None
 
 let buffer kind t ~id fd buf ~offset =
   if offset < 0L && not (kind = Raw.Write_file && offset = -1L) then
     invalid_arg "Iocp: negative offset";
-  submit t ~id fd buf (fun op -> Raw.submit_buffer op kind buf offset)
+  submit ~receive:(kind = Raw.Recv) t ~id fd buf (fun op ->
+      Raw.submit_buffer op kind buf offset)
 
 let read = buffer Raw.Read_file
 let write = buffer Raw.Write_file
+let recv t ~id fd buf = buffer Raw.Recv t ~id fd buf ~offset:0L
+let send t ~id fd buf = buffer Raw.Send t ~id fd buf ~offset:0L
+
+let accept t ~id fd ~client =
+  submit t ~id fd client (fun op -> Raw.submit_accept op client)
+
+let connect t ~id fd addr =
+  submit t ~id fd addr (fun op -> Raw.submit_connect op addr)
 
 let openfile path flags perm =
   let has f = List.mem f flags in
@@ -251,6 +270,28 @@ let openfile path flags perm =
 
 let pipe ?(read_async = true) ?(write_async = true) () =
   Raw.pipe_raw read_async write_async
+
+let shutdown t h cmd =
+  locked t (fun () ->
+      check_handle t h;
+      (try Unix.shutdown h.fd cmd
+       with Unix.Unix_error (ENOTCONN, _, _) as ex ->
+         (* A duplicated Winsock descriptor can lack the connection context. *)
+         let rec retry = function
+           | [] -> raise ex
+           | other :: rest when other.fd == h.fd -> retry rest
+           | other :: rest -> (
+               try Unix.shutdown other.fd cmd
+               with Unix.Unix_error (ENOTCONN, _, _) -> retry rest)
+         in
+         retry h.association.handles);
+      if cmd <> Unix.SHUTDOWN_SEND then
+        Hashtbl.iter
+          (fun _ r ->
+            if r.receive && r.handle.association == h.association then (
+              r.eof_on_cancel <- true;
+              Raw.cancel_operation r.operation))
+          t.requests)
 
 (*---------------------------------------------------------------------------
   Copyright (c) 2022 <patrick@sirref.org>

@@ -2,7 +2,8 @@
 
 Windows 10 and later I/O completion ports for OCaml 5.2 and later.
 
-The library provides file and pipe reads/writes, cancellation, and cross-thread notifications. Request IDs
+The library provides file and pipe reads/writes, socket send/receive,
+AcceptEx, ConnectEx, cancellation, and cross-thread notifications. Request IDs
 are ordinary positive integers. Buffers and request storage remain rooted until
 completion is consumed, including when cancellation races with successful I/O.
 There is no fixed limit on the number of outstanding requests.
@@ -20,6 +21,8 @@ There is no fixed limit on the number of outstanding requests.
 - Cancellation requests completion; it does not release the request's buffers.
 - Drain completions before closing registrations, then close the port. Both
   operations reject resources that are still busy.
+- Use `Iocp.shutdown` for local socket receive shutdown: Windows does not reliably
+  complete an outstanding receive when `Unix.shutdown` is used directly.
 - Explicit cleanup is required. Abandoning a pending request retains its resources
   rather than allowing Windows to access memory reclaimed by the GC.
 
@@ -66,6 +69,7 @@ dune runtest
 The suite runs in native and self-contained bytecode modes, so both use the
 current stubs rather than an older installed DLL. It exercises completion delivery,
 cancellation and GC, failed submission
-rollback, large request counts, file offsets, Unicode paths and private pipes. Tests use temporary files and ephemeral
+rollback, large request counts, file offsets, Unicode paths, private pipes,
+socket connection errors, and shutdown. Tests use temporary files and ephemeral
 ports. The earlier unreleased prototype API has been replaced; raw pointers,
 manual OVERLAPPED reuse, and the fixed-size request pool are no longer exposed.
