@@ -71,4 +71,33 @@ let ports () =
   Raw.acknowledge p;
   check "empty queue" (-1) (Raw.dequeue p 0)
 
-let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "creation permissions" `Quick creation_permissions ]; "ports", [ Alcotest.test_case "port lifecycle" `Quick ports ] ]
+(* Model a failure while converting a dequeued packet, before delivery commits. *)
+let retry_delivery () =
+  let p = Raw.create_port () in
+  Fun.protect ~finally:(fun () -> Raw.close_port p) @@ fun () ->
+  let rd, wr = Iocp.pipe () in
+  Fun.protect ~finally:(fun () ->
+      Unix.close rd;
+      Unix.close wr)
+  @@ fun () ->
+  Raw.associate_port p wr;
+  Fun.protect ~finally:(fun () -> Raw.detach wr) @@ fun () ->
+  let buf = Cstruct.of_string "x" in
+  let op = Raw.allocate p 1 wr buf in
+  ignore (Raw.submit_buffer op Raw.Write_file buf 0L);
+  check "first delivery" 1 (Raw.dequeue p 10000);
+  let first = Raw.completion op in
+  assert (
+    match first with
+    | Some c -> c.id = 1 && c.bytes_transferred = 1 && c.error = None
+    | None -> false);
+  Raw.wake_port p;
+  Gc.compact ();
+  check "retry the same packet" 1 (Raw.dequeue p 0);
+  assert (Raw.completion op = first);
+  Raw.acknowledge p;
+  check "next packet" 0 (Raw.dequeue p 0);
+  Raw.acknowledge p;
+  check "queue drained" (-1) (Raw.dequeue p 0)
+
+let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "creation permissions" `Quick creation_permissions ]; "ports", [ Alcotest.test_case "port lifecycle" `Quick ports; Alcotest.test_case "retry delivery" `Quick retry_delivery ] ]
