@@ -12,6 +12,7 @@ type completion = Raw.completion = {
 
 type t = {
   port : Raw.port;
+  skip_on_success : bool;
   lock : Mutex.t;
   requests : (int, request) Hashtbl.t;
   mutable registered : int;
@@ -19,7 +20,11 @@ type t = {
   mutable waiting : bool;
 }
 
-and association = { port_state : t; mutable handles : handle list }
+and association = {
+  port_state : t;
+  mutable skip : bool option;
+  mutable handles : handle list;
+}
 
 and handle = {
   association : association;
@@ -33,6 +38,7 @@ and request = {
   id : int;
   owner : Raw.port;
   handle : handle;
+  mutable immediate : bool;
 }
 
 let association_lock = Mutex.create ()
@@ -40,8 +46,9 @@ let associations : association list ref = ref []
 let locked t fn = Mutex.protect t.lock fn
 let check t = if t.closed then invalid_arg "Iocp: closed port"
 
-let create () =
+let create ?(skip_on_success = false) () =
   {
+    skip_on_success;
     port = Raw.create_port ();
     registered = 0;
     lock = Mutex.create ();
@@ -78,7 +85,7 @@ let register t fd =
             match found with
             | Some a when a.port_state == t -> a
             | Some _ -> raise (Unix.Unix_error (EINVAL, "Iocp.register", ""))
-            | None -> { port_state = t; handles = [] }
+            | None -> { port_state = t; skip = None; handles = [] }
           in
           let h = { association = a; fd; pending = 0; released = false } in
           let handles = h :: a.handles in
@@ -158,18 +165,40 @@ let submit t ~id h roots fn =
       check_handle t h;
       if id <= 0 || Hashtbl.mem t.requests id then
         invalid_arg "Iocp: duplicate or non-positive request ID";
-      let operation = Raw.allocate t.port id h.fd (h, roots) in
-      let r = { operation; id; owner = t.port; handle = h } in
+      let skip =
+        match h.association.skip with
+        | Some skip -> skip
+        | None ->
+            let skip = Raw.enable_immediate h.fd in
+            h.association.skip <- Some skip;
+            skip
+      in
+      let delivery =
+        if not skip then Raw.Native_queue
+        else if t.skip_on_success then Raw.Immediate
+        else Raw.Post_queue
+      in
+      let operation = Raw.allocate t.port id h.fd (h, roots) delivery in
+      let r =
+        { operation; id; owner = t.port; handle = h; immediate = false }
+      in
       h.pending <- h.pending + 1;
       match
         Hashtbl.add t.requests id r;
         fn operation
       with
-      | () -> r
+      | immediate ->
+          r.immediate <- immediate;
+          if immediate then (
+            h.pending <- h.pending - 1;
+            Hashtbl.remove t.requests id);
+          r
       | exception ex ->
           h.pending <- h.pending - 1;
           Hashtbl.remove t.requests id;
           raise ex)
+
+let result r = if r.immediate then Raw.completion r.operation else None
 
 let buffer kind t ~id fd buf ~offset =
   if offset < 0L && not (kind = Raw.Write_file && offset = -1L) then

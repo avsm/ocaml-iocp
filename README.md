@@ -49,6 +49,12 @@ read-only file with write access, a single overlapped open sets the attribute
 at creation and preserves the creator's write access.
 Offsets are 64-bit, and append mode does not grant additional write access.
 
+`Iocp.create ~skip_on_success:true ()` avoids a completion-port round trip when
+Windows completes an operation immediately. In this mode, check `Iocp.result`
+after each submission: `Some completion` is already finished; `None` must be
+drained with `Iocp.wait`. Unsupported providers retain queued delivery. The
+default mode continues to deliver every completion through `wait`.
+
 ## Build and test
 
 ```
@@ -57,8 +63,8 @@ dune build @install
 dune runtest
 ```
 
-The suite runs in native and self-contained bytecode modes, so both use the
-current stubs rather than an older installed DLL. It exercises completion delivery,
+The suite runs in native, self-contained bytecode and dynamically loaded
+bytecode modes. It exercises completion delivery,
 cancellation and GC, failed submission
 rollback, large request counts, file offsets, Unicode paths and private pipes. Tests use temporary files and ephemeral
 ports. The earlier unreleased prototype API has been replaced; raw pointers,

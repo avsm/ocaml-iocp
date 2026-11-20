@@ -43,8 +43,8 @@ let success p id bytes =
   | None -> ()
   | Some e -> Alcotest.fail (Unix.error_message e)
 
-let with_port fn =
-  let p = Iocp.create () in
+let with_port ?(skip_on_success = false) fn =
+  let p = Iocp.create ~skip_on_success () in
   Fun.protect
     ~finally:(fun () ->
       Iocp.cancel_all p;
@@ -54,13 +54,13 @@ let with_port fn =
       close_port p)
     (fun () -> fn p)
 
-let with_pipe fn =
+let with_pipe ?(skip_on_success = false) fn =
   let r, w = Iocp.pipe () in
   Fun.protect
     ~finally:(fun () ->
       close_fd r;
       close_fd w)
-    (fun () -> with_port (fun p -> fn p r w))
+    (fun () -> with_port ~skip_on_success (fun p -> fn p r w))
 
 let invalid fn =
   match fn () with
@@ -114,6 +114,25 @@ let cancel_gc () =
   Iocp.cancel p request;
   check "drained" 0 (Iocp.pending p)
 
+let completed_buffer () =
+  List.iter
+    (fun skip_on_success ->
+      with_pipe ~skip_on_success @@ fun p _ w ->
+      let h = handle p w in
+      let weak = Weak.create 1 in
+      let request =
+        let buf = Cstruct.create 1 in
+        Weak.set weak 0 (Some buf);
+        Iocp.write p ~id:1 h buf ~offset:0L
+      in
+      let c = match Iocp.result request with Some c -> c | None -> status p in
+      assert (c.error = None);
+      Gc.full_major ();
+      Alcotest.(check bool)
+        "completed buffer released" false (Weak.check weak 0);
+      ignore (Sys.opaque_identity request))
+    [ false; true ]
+
 let lifetime () =
   with_pipe @@ fun p r _w ->
   ignore (Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L);
@@ -163,7 +182,7 @@ let retry_delivery () =
   Raw.associate_port p wr;
   Fun.protect ~finally:(fun () -> Raw.detach wr) @@ fun () ->
   let buf = Cstruct.of_string "x" in
-  let op = Raw.allocate p 1 wr buf in
+  let op = Raw.allocate p 1 wr buf Raw.Native_queue in
   ignore (Raw.submit_buffer op Raw.Write_file buf 0L);
   check "first delivery" 1 (Raw.dequeue p 10000);
   let first = Raw.completion op in
@@ -292,6 +311,49 @@ let pipe_eof () =
     assert (Iocp.wait p ~timeout:0 = None)
   done
 
+let immediate () =
+  let p = Iocp.create ~skip_on_success:true () in
+  let r, w = Iocp.pipe () in
+  Fun.protect ~finally:(fun () ->
+      close_port p;
+      close_fd r;
+      close_fd w)
+  @@ fun () ->
+  let inline = ref 0 in
+  let finish request =
+    let c =
+      match Iocp.result request with
+      | Some c ->
+          incr inline;
+          assert (Iocp.result request = Some c);
+          c
+      | None -> status p
+    in
+    assert (c.error = None);
+    check "one byte" 1 c.bytes_transferred
+  in
+  for _ = 1 to 100 do
+    finish (Iocp.write p ~id:1 (handle p w) (Cstruct.of_string "x") ~offset:0L);
+    let buf = Cstruct.create 1 in
+    finish (Iocp.read p ~id:2 (handle p r) buf ~offset:0L);
+    Alcotest.(check string) "pipe contents" "x" (Cstruct.to_string buf);
+    check "drained" 0 (Iocp.pending p);
+    assert (Iocp.wait p ~timeout:0 = None)
+  done;
+  Alcotest.(check bool) "used inline completions" true (!inline > 0);
+  let eof, writer = Iocp.pipe () in
+  close_fd writer;
+  Fun.protect ~finally:(fun () -> close_fd eof) @@ fun () ->
+  for _ = 1 to 20 do
+    let request =
+      Iocp.read p ~id:3 (handle p eof) (Cstruct.create 1) ~offset:0L
+    in
+    let c = match Iocp.result request with Some c -> c | None -> status p in
+    assert (c.error = None);
+    check "EOF" 0 c.bytes_transferred;
+    assert (Iocp.wait p ~timeout:0 = None)
+  done
+
 let open_flags () =
   let path = Filename.temp_file "iocp-open" ".tmp" in
   Sys.remove path;
@@ -406,6 +468,46 @@ let creation_permissions () =
         ])
     [ Unix.O_RDONLY; O_WRONLY; O_RDWR ]
 
+let replaced_descriptor () =
+  List.iter
+    (fun skip_on_success ->
+      let p = Iocp.create ~skip_on_success () in
+      let target, writer = Iocp.pipe () in
+      close_fd writer;
+      Fun.protect ~finally:(fun () ->
+          close_fd target;
+          close_port p)
+      @@ fun () ->
+      associate p target;
+      let finish r =
+        match Iocp.result r with Some c -> c | None -> status p
+      in
+      for n = 1 to 100 do
+        let source, writer = Iocp.pipe () in
+        Fun.protect ~finally:(fun () ->
+            close_fd source;
+            close_fd writer)
+        @@ fun () ->
+        release_matching (fun (_, original, _) -> original == target);
+        Unix.dup2 source target;
+        Unix.dup2 source target;
+        if n mod 10 = 0 then Gc.compact ();
+        let buf = Cstruct.create 1 in
+        let read = Iocp.read p ~id:(2 * n) (handle p target) buf ~offset:0L in
+        let write =
+          Iocp.write p
+            ~id:((2 * n) + 1)
+            (handle p writer) (Cstruct.of_string "x") ~offset:0L
+        in
+        let a = finish read and b = finish write in
+        assert (a.error = None && b.error = None);
+        check "both completions" ((4 * n) + 1) (a.id + b.id);
+        Alcotest.(check string)
+          "replacement contents" "x" (Cstruct.to_string buf);
+        check "drained" 0 (Iocp.pending p)
+      done)
+    [ false; true ]
+
 let failed_registration () =
   let sync, writer = Iocp.pipe ~read_async:false () in
   Fun.protect ~finally:(fun () ->
@@ -431,6 +533,25 @@ let with_registration p fd fn =
   let h = Iocp.register p fd in
   Fun.protect ~finally:(fun () -> Iocp.close_handle h) (fun () -> fn h)
 
+let registered_aliases ~skip_on_success () =
+  with_pipe ~skip_on_success @@ fun p r w ->
+  let alias = Unix.dup ~cloexec:true r in
+  Fun.protect ~finally:(fun () -> Unix.close alias) @@ fun () ->
+  with_registration p r @@ fun original ->
+  with_registration p alias @@ fun duplicate ->
+  with_registration p w @@ fun writer ->
+  let buf = Cstruct.create 1 in
+  let read = Iocp.read p ~id:1 duplicate buf ~offset:0L in
+  invalid (fun () -> Iocp.close_handle duplicate);
+  Iocp.close_handle original;
+  invalid (fun () -> ignore (Iocp.read p ~id:3 original buf ~offset:0L));
+  let write = Iocp.write p ~id:2 writer (Cstruct.of_string "x") ~offset:0L in
+  let finish r = match Iocp.result r with Some c -> c | None -> status p in
+  let a = finish read and b = finish write in
+  assert (a.error = None && b.error = None);
+  check "both completions" 3 (a.id + b.id);
+  Alcotest.(check string) "alias contents" "x" (Cstruct.to_string buf)
+
 let registered_pending () =
   with_pipe @@ fun p r w ->
   with_registration p r @@ fun reader ->
@@ -445,6 +566,33 @@ let registered_pending () =
   Iocp.cancel p pending;
   assert ((status p).error <> None);
   Iocp.close_handle reader
+
+let registration_reuse () =
+  let r, w = Iocp.pipe () in
+  Fun.protect ~finally:(fun () ->
+      Unix.close r;
+      Unix.close w)
+  @@ fun () ->
+  List.iter
+    (fun skip_on_success ->
+      let p = Iocp.create ~skip_on_success () in
+      Fun.protect ~finally:(fun () -> Iocp.close p) @@ fun () ->
+      with_registration p r @@ fun reader ->
+      with_registration p w @@ fun writer ->
+      let finish request =
+        let immediate = Iocp.result request in
+        assert (immediate <> None = skip_on_success);
+        let c = match immediate with Some c -> c | None -> status p in
+        assert (c.error = None);
+        check "one byte" 1 c.bytes_transferred
+      in
+      finish (Iocp.write p ~id:1 writer (Cstruct.of_string "x") ~offset:0L);
+      let buf = Cstruct.create 1 in
+      finish (Iocp.read p ~id:2 reader buf ~offset:0L);
+      Alcotest.(check string)
+        "re-registered contents" "x" (Cstruct.to_string buf);
+      assert (Iocp.wait p ~timeout:0 = None))
+    [ true; false; true; false ]
 
 let foreign_alias_reuse () =
   with_pipe @@ fun p target _ ->
@@ -468,12 +616,18 @@ let () =
           (fun (n, f) -> Alcotest.test_case n `Quick f)
           [
             ("file creation and append flags", open_flags);
-            ("file delete sharing", delete_sharing);
             ("file creation permissions", creation_permissions);
+            ("file delete sharing", delete_sharing);
+            ("replaced descriptor", replaced_descriptor);
             ("association ownership", association_ownership);
             ("failed registration", failed_registration);
+            ("registered aliases", registered_aliases ~skip_on_success:false);
+            ( "registered aliases with immediate completion",
+              registered_aliases ~skip_on_success:true );
             ("registration with multiple pending requests", registered_pending);
+            ("registration reuse across modes", registration_reuse);
             ("foreign alias after handle reuse", foreign_alias_reuse);
+            ("immediate completion without duplicates", immediate);
             ("cancel blocked pipe write", cancel_write);
             ("pipe EOF", pipe_eof);
             ("append preserves access", append_access);
@@ -487,6 +641,7 @@ let () =
             ("pipe", pipe);
             ("cancel and GC", cancel_gc);
             ("lifetime", lifetime);
+            ("completed buffer lifetime", completed_buffer);
             ("submission rollback", submission_failure);
             ("more than 1024 requests", many_requests);
             ("cross-domain wake", wake);
