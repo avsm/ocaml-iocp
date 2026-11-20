@@ -37,6 +37,8 @@
 #include <Minwinbase.h>
 #include <Mswsock.h>
 #include <bcrypt.h>
+#include <winternl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
 
@@ -382,6 +384,110 @@ CAMLnoret CAMLextern void caml_uerror(const char *, value);
 static void raise_win32(DWORD err, const char *name) {
   caml_win32_maperr(err);
   caml_uerror(name, Nothing);
+}
+
+/* Windows may dequeue a packet while the OCaml runtime lock is released. */
+typedef struct {
+  HANDLE handle;
+  intnat ready_id; /* -1 for an empty slot, 0 for a wake notification. */
+} port_state;
+#define State(v) (*(port_state **)Data_custom_val(v))
+#define Port(v) (State(v)->handle)
+static void finalize_port(value v) {
+  if (State(v) != NULL) {
+    if (Port(v) != NULL)
+      CloseHandle(Port(v));
+    caml_stat_free(State(v));
+  }
+}
+static struct custom_operations port_ops = {"iocp.port",
+                                            finalize_port,
+                                            custom_compare_default,
+                                            custom_hash_default,
+                                            custom_serialize_default,
+                                            custom_deserialize_default,
+                                            custom_compare_ext_default,
+                                            custom_fixed_length_default};
+static HANDLE port(value v) {
+  if (Port(v) == NULL)
+    caml_invalid_argument("Iocp: closed port");
+  return Port(v);
+}
+CAMLprim value iocp_create(value unit) {
+  CAMLparam1(unit);
+  CAMLlocal1(v);
+  v = caml_alloc_custom_mem(&port_ops, sizeof(port_state *), sizeof(port_state));
+  State(v) = NULL;
+  port_state *state = caml_stat_alloc(sizeof(*state));
+  State(v) = state;
+  state->ready_id = -1;
+  Port(v) = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, MAXDWORD);
+  if (Port(v) == NULL)
+    raise_win32(GetLastError(), "CreateIoCompletionPort");
+  CAMLreturn(v);
+}
+CAMLprim value iocp_close(value v) {
+  if (Port(v) != NULL) {
+    if (!CloseHandle(Port(v)))
+      raise_win32(GetLastError(), "CloseHandle");
+    Port(v) = NULL;
+  }
+  return Val_unit;
+}
+CAMLprim value iocp_same_handle(value a, value b) {
+  typedef BOOL (WINAPI *compare_fn)(HANDLE, HANDLE);
+  compare_fn compare = (compare_fn)GetProcAddress(
+      GetModuleHandleW(L"kernelbase.dll"), "CompareObjectHandles");
+  if (!compare)
+    caml_failwith("Iocp: CompareObjectHandles is unavailable");
+  return Val_bool(compare(Handle_val(a), Handle_val(b)));
+}
+CAMLprim value iocp_associate(value v, value fd) {
+  if (!CreateIoCompletionPort(Handle_val(fd), port(v), 0, 0))
+    raise_win32(GetLastError(), "CreateIoCompletionPort");
+  return Val_unit;
+}
+
+NTSYSAPI NTSTATUS NTAPI NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                           FILE_INFORMATION_CLASS);
+NTSYSAPI ULONG NTAPI RtlNtStatusToDosError(NTSTATUS);
+CAMLprim value iocp_detach(value fd) {
+  struct { HANDLE port; PVOID key; } info = {NULL, NULL};
+  IO_STATUS_BLOCK io;
+  /* FileReplaceCompletionInformation is absent from MinGW's winternl.h. */
+  NTSTATUS status = NtSetInformationFile(Handle_val(fd), &io, &info, sizeof(info),
+                                       (FILE_INFORMATION_CLASS)61);
+  if (status < 0)
+    raise_win32(RtlNtStatusToDosError(status), "NtSetInformationFile");
+  return Val_unit;
+}
+CAMLprim value iocp_wake(value v) {
+  if (!PostQueuedCompletionStatus(port(v), 0, 0, NULL))
+    raise_win32(GetLastError(), "PostQueuedCompletionStatus");
+  return Val_unit;
+}
+
+CAMLprim value iocp_dequeue(value p, value timeout) {
+  CAMLparam2(p, timeout);
+  port_state *state = State(p);
+  if (state->ready_id < 0) {
+    DWORD bytes, ms = (DWORD)Long_val(timeout);
+    ULONG_PTR key;
+    OVERLAPPED *ol = NULL;
+    caml_enter_blocking_section();
+    BOOL ok = GetQueuedCompletionStatus(state->handle, &bytes, &key, &ol, ms);
+    DWORD err = ok ? 0 : GetLastError();
+    if (ok) state->ready_id = 0;
+    caml_leave_blocking_section();
+    if (!ol && !ok && err != WAIT_TIMEOUT)
+      raise_win32(err, "GetQueuedCompletionStatus");
+  }
+  CAMLreturn(Val_long(state->ready_id));
+}
+
+CAMLprim value iocp_acknowledge(value p) {
+  State(p)->ready_id = -1;
+  return Val_unit;
 }
 
 static DWORD file_access(value access, value append) {

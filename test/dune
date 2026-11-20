@@ -25,7 +25,9 @@
  (action
   (run ./t1.exe)))
 
+(copy_files ../src/raw.ml)
+
 (test
  (name test_iocp)
- (modules test_iocp)
+ (modules test_iocp raw)
  (libraries iocp alcotest))

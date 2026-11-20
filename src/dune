@@ -7,4 +7,4 @@
  (foreign_stubs
   (language c)
   (names iocp_stubs))
- (c_library_flags -lbcrypt))
+ (c_library_flags -lbcrypt -lntdll))
