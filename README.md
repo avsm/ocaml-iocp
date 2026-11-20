@@ -66,8 +66,8 @@ dune build @install
 dune runtest
 ```
 
-The suite runs in native and self-contained bytecode modes, so both use the
-current stubs rather than an older installed DLL. It exercises completion delivery,
+The suite runs in native, self-contained bytecode and dynamically loaded
+bytecode modes. It exercises completion delivery,
 cancellation and GC, failed submission
 rollback, large request counts, file offsets, Unicode paths, private pipes,
 socket connection errors, and shutdown. Tests use temporary files and ephemeral

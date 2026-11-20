@@ -3,7 +3,7 @@
 (test
  (name test_iocp)
  (modules test_iocp raw)
- (modes byte_complete exe)
+ (modes byte byte_complete exe)
  (libraries iocp alcotest)
  (enabled_if (= %{os_type} "Win32")))
 

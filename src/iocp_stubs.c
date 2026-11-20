@@ -38,6 +38,7 @@
 
 CAMLextern value caml_win32_alloc_handle(HANDLE);
 CAMLextern void caml_win32_maperr(DWORD);
+CAMLextern void caml_unix_check_path(value, const char *);
 CAMLextern value caml_unix_error_of_code(int);
 #ifdef caml_unix_alloc_sockaddr
 CAMLextern value(caml_unix_alloc_sockaddr)(struct sockaddr *, socklen_t, int);
