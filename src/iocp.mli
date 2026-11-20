@@ -38,6 +38,16 @@ val openfile :
     read-only attribute when opening the file. Append restricts writable handles
     to appending. Read-only handles keep their original access. *)
 
+val pipe :
+  ?read_async:bool ->
+  ?write_async:bool ->
+  unit ->
+  Unix.file_descr * Unix.file_descr
+(** Create a private, non-inheritable byte pipe and return its read and write
+    ends. The caller closes both with [Unix.close]. Both support overlapped I/O
+    by default. Set an end's option to false for synchronous child standard I/O.
+    Only asynchronous ends may use a port. *)
+
 val read : t -> fd -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t
 
 val write : t -> fd -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t

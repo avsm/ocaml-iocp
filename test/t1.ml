@@ -1,8 +1,12 @@
 module IM = Iocp
 
+let pipe_ends p =
+  let r, w = Iocp.pipe () in
+  Iocp.Raw.associate_fd_with_iocp p r 1, Iocp.Raw.associate_fd_with_iocp p w 2
+
 let pipe () =
   let iocp = Iocp.Raw.create_io_completion_port 10 in
-  let rfd, wfd = Iocp.Raw.pipe iocp 1 2 "iocpPipe" in
+  let rfd, wfd = pipe_ends iocp in
   let s = "Hello" in
   let buf = Cstruct.of_string s in
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
@@ -32,7 +36,7 @@ let pipe () =
 
 let cancel () =
   let iocp = Iocp.Raw.create_io_completion_port 10 in
-  let rfd, _wfd = Iocp.Raw.pipe iocp 1 2 "iocpPipeCancel" in
+  let rfd, _wfd = pipe_ends iocp in
   let buf' = Cstruct.create 100 in
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let ol_id = Iocp.Overlapped.id ol in
@@ -114,7 +118,7 @@ let multicore_read max () =
       raise e
   in
   let iocp = Iocp.Raw.create_io_completion_port max in
-  let rfd, wfd = Iocp.Raw.pipe iocp 1 2 (Format.sprintf "iocpPipe%d" max) in
+  let rfd, wfd = pipe_ends iocp in
   let s = "Hello" in
   let write_buf = Cstruct.of_string s in
   let create_writes n =
@@ -187,7 +191,7 @@ let multicore_read_unsafe () =
   let m = 4 in
   Format.eprintf "xxxxxxxxxx multicore_read_unsafe\n%!";
   let iocp = Iocp.Raw.create_io_completion_port 4 in
-  let rfd, wfd = Iocp.Raw.pipe iocp 1 2 "iocpPipeunsafe" in
+  let rfd, wfd = pipe_ends iocp in
   let s = "Hello" in
   let write_buf = Cstruct.of_string s in
   let create_writes n =

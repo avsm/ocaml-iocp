@@ -36,6 +36,7 @@
 #include <Fileapi.h>
 #include <Minwinbase.h>
 #include <Mswsock.h>
+#include <bcrypt.h>
 #include <stdio.h>
 #include <assert.h>
 
@@ -375,76 +376,6 @@ value ocaml_iocp_cancel(value v_fd, value v_overlapped) {
    DEALINGS IN THE SOFTWARE.
   ---------------------------------------------------------------------------*/
 
-value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
-{
-  CAMLparam4(v_iocp, v_id1, v_id2, v_path);
-  CAMLlocal2(readfd, writefd);
-  value res;
-  char *wpath = caml_stat_strdup(String_val(v_path));
-  HANDLE iocp = Handle_val(v_iocp);
-
-  SECURITY_ATTRIBUTES attr;
-  attr.nLength = sizeof(attr);
-  attr.lpSecurityDescriptor = NULL;
-  attr.bInheritHandle = TRUE;
-
-  HANDLE pipeR = CreateNamedPipe(
-        TEXT(wpath), // name of the pipe
-        (PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED),
-        (PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT),
-        1, // only allow 1 instance of this pipe
-        SIZEBUF,
-        SIZEBUF,
-        PIPE_WAIT, // use default wait time
-        &attr // use default security attributes
-    );
-
-  caml_stat_free(wpath);
-
-  if (pipeR == INVALID_HANDLE_VALUE || pipeR == NULL) {
-    win32_maperr(GetLastError());
-    uerror("CreateNamedPipe", Nothing);
-  }
-
-  HANDLE pipeW = CreateFile(
-        TEXT(wpath),
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-        &attr);
-
-  if (pipeW == INVALID_HANDLE_VALUE || pipeW == NULL) {
-    printf("Write handle failed\n");
-    win32_maperr(GetLastError());
-    uerror("CreateNamedPipe", Nothing);
-  }
-
-  HANDLE t = CreateIoCompletionPort(pipeR, iocp, v_id1, 0);
-
-  if (t == NULL) {
-      win32_maperr(GetLastError());
-      // printf("RETURNING FAILED %i\n", GetLastError());
-      uerror("CreateIoCompletionPort1", Nothing);
-    }
-
-  t = CreateIoCompletionPort(pipeW, iocp, v_id2, 0);
-
-  if (t == NULL) {
-      win32_maperr(GetLastError());
-      // printf("RETURNING FAILED %i\n", GetLastError());
-      uerror("CreateIoCompletionPort2", Nothing);
-    }
-
-  writefd = win_alloc_handle(pipeW);
-  readfd = win_alloc_handle(pipeR);
-  res = caml_alloc_small(2, 0);
-  Field(res, 0) = readfd;
-  Field(res, 1) = writefd;
-  CAMLreturn(res);
-}
-
 CAMLextern value caml_win32_alloc_handle(HANDLE);
 CAMLextern void caml_win32_maperr(DWORD);
 CAMLnoret CAMLextern void caml_uerror(const char *, value);
@@ -497,5 +428,43 @@ CAMLprim value iocp_create_readonly(value path, value access, value append,
   if (err)
     raise_win32(err, "CreateFileW");
   Handle_val(result) = h;
+  CAMLreturn(result);
+}
+
+CAMLprim value iocp_pipe(value read_async, value write_async) {
+  CAMLparam2(read_async, write_async);
+  CAMLlocal3(result, rd, wr);
+  rd = caml_win32_alloc_handle(INVALID_HANDLE_VALUE);
+  wr = caml_win32_alloc_handle(INVALID_HANDLE_VALUE);
+  result = caml_alloc_tuple(2);
+  Store_field(result, 0, rd);
+  Store_field(result, 1, wr);
+  unsigned long long random[2];
+  NTSTATUS status =
+      BCryptGenRandom(NULL, (PUCHAR)random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (status != 0)
+    caml_failwith("Iocp.pipe: BCryptGenRandom failed");
+  wchar_t name[96];
+  swprintf(name, 96, L"\\\\.\\pipe\\ocaml-iocp-%016llx%016llx", random[0], random[1]);
+  DWORD rf = Bool_val(read_async) ? FILE_FLAG_OVERLAPPED : 0;
+  DWORD wf = Bool_val(write_async) ? FILE_FLAG_OVERLAPPED : 0;
+  caml_enter_blocking_section();
+  HANDLE r = CreateNamedPipeW(name, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | rf,
+                              PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536,
+                              65536, 0, NULL);
+  DWORD err = r == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+  HANDLE w = INVALID_HANDLE_VALUE;
+  if (!err) {
+    w = CreateFileW(name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, wf, NULL);
+    if (w == INVALID_HANDLE_VALUE) {
+      err = GetLastError();
+      CloseHandle(r);
+    }
+  }
+  caml_leave_blocking_section();
+  if (err)
+    raise_win32(err, "Iocp.pipe");
+  Handle_val(rd) = r;
+  Handle_val(wr) = w;
   CAMLreturn(result);
 }

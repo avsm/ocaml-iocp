@@ -12,13 +12,6 @@ external create_io_completion_port : int -> t
 external associate_fd_with_iocp : t -> Unix.file_descr -> id -> Handle.t
   = "ocaml_iocp_associate_fd_with_iocp"
 
-external pipe' : t -> id -> id -> string -> Handle.t * Handle.t
-  = "ocaml_iocp_unix_pipe"
-
-let pipe iocp id1 id2 name =
-  let path = "\\\\.\\pipe\\" ^ name in
-  pipe' iocp id1 id2 path
-
 type completion_status = private
   | Cs_none
   | Cs_some of {

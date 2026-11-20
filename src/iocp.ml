@@ -116,6 +116,9 @@ let openfile path flags perm =
     Unix.close fd;
     raise ex
 
+let pipe ?(read_async = true) ?(write_async = true) () =
+  Native.pipe_raw read_async write_async
+
 let read : t -> Handle.t -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t =
   fun v fd buf ~pos ~len ~off ->
     let root = ReadWrite buf in

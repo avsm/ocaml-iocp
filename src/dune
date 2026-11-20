@@ -6,4 +6,5 @@
  (libraries unix cstruct optint threads)
  (foreign_stubs
   (language c)
-  (names iocp_stubs)))
+  (names iocp_stubs))
+ (c_library_flags -lbcrypt))
