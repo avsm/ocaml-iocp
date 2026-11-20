@@ -1,9 +1,9 @@
 (lang dune 2.9)
 (name iocp)
 (generate_opam_files true)
-(source (github patricoferris/ocaml-iocp))
+(source (github ocaml-multicore/ocaml-iocp))
 (license "MIT")
-(authors "Patrick Ferris")
+(authors "Patrick Ferris" "Anil Madhavapeddy <anil@recoil.org>")
 (maintainers "patrick@sirref.org")
 (package
  (name iocp)
@@ -12,5 +12,4 @@
  (depends
    cstruct
    optint
-   (mdx :with-test)
    (alcotest :with-test)))

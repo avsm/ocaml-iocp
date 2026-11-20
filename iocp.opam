@@ -4,15 +4,14 @@ synopsis: "OCaml bindings for Windows IOCP"
 description:
   "Bindings to the Windows IOCP API. See https://github.com/ocaml-multicore/eio for a higher-level API using this."
 maintainer: ["patrick@sirref.org"]
-authors: ["Patrick Ferris"]
+authors: ["Patrick Ferris" "Anil Madhavapeddy <anil@recoil.org>"]
 license: "MIT"
-homepage: "https://github.com/patricoferris/ocaml-iocp"
-bug-reports: "https://github.com/patricoferris/ocaml-iocp/issues"
+homepage: "https://github.com/ocaml-multicore/ocaml-iocp"
+bug-reports: "https://github.com/ocaml-multicore/ocaml-iocp/issues"
 depends: [
   "dune" {>= "2.9"}
   "cstruct"
   "optint"
-  "mdx" {with-test}
   "alcotest" {with-test}
   "odoc" {with-doc}
 ]
@@ -32,4 +31,5 @@ build: [
   ]
   ["dune" "install" "-p" name "--create-install-files" name]
 ]
-dev-repo: "git+https://github.com/patricoferris/ocaml-iocp.git"
+dev-repo: "git+https://github.com/ocaml-multicore/ocaml-iocp.git"
+available: os = "win32"
