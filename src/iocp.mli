@@ -3,12 +3,9 @@
     Bindings to input/output completion ports (IOCP) allowing for efficient,
     asynchronous IO on Windows. *)
 
-module Wsabuf = Wsabuf
 module Overlapped = Overlapped
 module Handle = Handle
 module Raw = Raw
-module Accept_buffer = Accept_buffer
-module Sockaddr = Sockaddr
 
 type t
 type fd = Handle.t
@@ -34,14 +31,6 @@ val openfile: t -> int -> string -> Unix.open_flag list -> int -> fd
 val read : t -> fd -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t
 
 val write : t -> fd -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t
-
-val accept : t -> fd -> Handle.t -> Accept_buffer.t -> Id.t
-
-val recv : t -> fd -> Cstruct.t list -> Id.t
-
-val send : t -> fd -> Cstruct.t list -> Id.t
-
-val connect : t -> fd -> Sockaddr.t -> Id.t
 
 type completion_status = {
   bytes_transferred : int;

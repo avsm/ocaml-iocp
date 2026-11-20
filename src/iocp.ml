@@ -3,12 +3,9 @@
    Distributed under the MIT license. See terms at the end of this file.
   ----------------------------------------------------------------------*)
 
-module Wsabuf = Wsabuf
-module Sockaddr = Sockaddr
 module Handle = Handle
 module Overlapped = Overlapped
 module Raw = Raw
-module Accept_buffer = Accept_buffer
 
 module Id = struct
   type t = int
@@ -24,8 +21,6 @@ module H = Hashtbl.Make(Id)
 
 type roots =
   | ReadWrite of Cstruct.buffer
-  | RecvSend of Wsabuf.t
-  | Connect of Sockaddr.t
 
 type t = {
   iocp : Raw.t;
@@ -111,37 +106,6 @@ let completion_status : t -> timeout:int -> completion_status option =
       Some { bytes_transferred = cs.bytes_transferred
           ; id = external_key
           ; error = cs.error }
-
-let accept : t -> Handle.t -> Handle.t -> Accept_buffer.t -> Id.t =
-  fun v sock sock_accept addr_buf ->
-    let buf = Cstruct.to_bigarray addr_buf in
-    let root = ReadWrite buf in
-    let ol, external_id = get_overlapped v sock root in
-    let () = Raw.accept sock sock_accept buf ol in
-    external_id
-
-let recv : t -> Handle.t -> Cstruct.t list -> Id.t =
-  fun v sock bufs ->
-    let wsabuf = Wsabuf.create bufs in
-    let root = RecvSend wsabuf in
-    let ol, external_id = get_overlapped v sock root in
-    let () = Raw.recv v.iocp sock wsabuf ol in
-    external_id
-
-let send : t -> Handle.t -> Cstruct.t list -> Id.t =
-  fun v sock bufs ->
-    let wsabuf = Wsabuf.create bufs in
-    let root = RecvSend wsabuf in
-    let ol, external_id = get_overlapped v sock root in
-    let () = Raw.send v.iocp sock wsabuf ol in
-    external_id
-    
-let connect : t -> Handle.t -> Sockaddr.t -> Id.t =
-  fun v sock addr ->
-    let root = Connect addr in
-    let ol, external_id = get_overlapped v sock root in
-    let () = Raw.connect v.iocp sock addr ol in
-    external_id
 
 let garbage = Atomic.make []
 
