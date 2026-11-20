@@ -125,6 +125,153 @@ CAMLprim value iocp_wake(value v) {
   return Val_unit;
 }
 
+/*-----------------------------------------------------------------------
+   Copyright (c) 2022 Patrick Ferris <patrick@sirref.org>
+   Distributed under the MIT license. See terms further down in the file.
+  -----------------------------------------------------------------------*/
+
+/* Constant constructors of Raw.buffer_op come first, in declaration order. */
+enum operation_kind { OP_READ, OP_WRITE };
+
+typedef struct {
+  OVERLAPPED overlapped; /* Must be first: completion packets return this address. */
+  HANDLE fd;
+  enum operation_kind kind;
+  intnat id;
+  value roots;
+  int pending;
+  DWORD bytes;
+  DWORD error;
+} request;
+#define Request(v) (*(request **)Data_custom_val(Field(v, 0)))
+static void finalize_request(value v) {
+  request *r = *(request **)Data_custom_val(v);
+  if (r != NULL) {
+    assert(!r->pending);
+    caml_stat_free(r);
+  }
+}
+static struct custom_operations request_ops = {"iocp.request",
+                                               finalize_request,
+                                               custom_compare_default,
+                                               custom_hash_default,
+                                               custom_serialize_default,
+                                               custom_deserialize_default,
+                                               custom_compare_ext_default,
+                                               custom_fixed_length_default};
+CAMLprim value iocp_allocate(value p, value id, value fd, value buffers) {
+  CAMLparam4(p, id, fd, buffers);
+  CAMLlocal2(v, storage);
+  storage = caml_alloc_custom_mem(&request_ops, sizeof(request *), sizeof(request));
+  *(request **)Data_custom_val(storage) = NULL;
+  request *r = caml_stat_alloc(sizeof(request));
+  memset(r, 0, sizeof(*r));
+  *(request **)Data_custom_val(storage) = r;
+  r->fd = Handle_val(fd);
+  r->id = Long_val(id);
+  v = caml_alloc_tuple(4);
+  Store_field(v, 0, storage);
+  Store_field(v, 1, p);
+  Store_field(v, 2, fd);
+  Store_field(v, 3, buffers);
+  CAMLreturn(v);
+}
+static void start(value v) {
+  request *r = Request(v);
+  r->roots = v;
+  caml_register_generational_global_root(&r->roots);
+  r->pending = 1;
+}
+static void finish(request *r) {
+  Store_field(r->roots, 3, Val_unit);
+  r->pending = 0;
+  caml_remove_generational_global_root(&r->roots);
+}
+static void record_result(request *r, DWORD bytes, DWORD err) {
+  if (!err) err = r->error;
+  if (r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) {
+    err = 0;
+    bytes = 0;
+  }
+  r->bytes = bytes;
+  r->error = err;
+}
+
+static value completion(request *r) {
+  CAMLparam0();
+  CAMLlocal3(result, error, code);
+  DWORD err = r->error, bytes = r->bytes;
+  error = Val_none;
+  if (err) {
+    caml_win32_maperr(err);
+    code = caml_unix_error_of_code(errno);
+    error = caml_alloc_some(code);
+  }
+  result = caml_alloc_tuple(3);
+  Store_field(result, 0, Val_long(r->id));
+  Store_field(result, 1, Val_long(bytes));
+  Store_field(result, 2, error);
+  CAMLreturn(caml_alloc_some(result));
+}
+static value submitted(request *r, DWORD err, const char *op) {
+  if (err != ERROR_SUCCESS && err != ERROR_IO_PENDING) {
+    finish(r);
+    raise_win32(err, op);
+  }
+  return Val_unit;
+}
+CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) {
+  CAMLparam4(v, kind, buf, offset);
+  request *r = Request(v);
+  value ba = Field(buf, 0);
+  intnat pos = Long_val(Field(buf, 1)), len = Long_val(Field(buf, 2));
+  intnat size = Caml_ba_array_val(ba)->dim[0];
+  if (pos < 0 || len < 0 || pos > size || len > size - pos || (uintnat)len > MAXDWORD)
+    caml_invalid_argument("Iocp: buffer bounds");
+  char *data = (char *)Caml_ba_data_val(ba) + pos;
+  uint64_t off = (uint64_t)Int64_val(offset);
+  r->overlapped.Offset = (DWORD)off;
+  r->overlapped.OffsetHigh = (DWORD)(off >> 32);
+  r->kind = Int_val(kind);
+  DWORD err = 0;
+  start(v);
+  switch (r->kind) {
+  case OP_READ:
+    if (!ReadFile(r->fd, data, (DWORD)len, NULL, &r->overlapped))
+      err = GetLastError();
+    break;
+  case OP_WRITE:
+    if (!WriteFile(r->fd, data, (DWORD)len, NULL, &r->overlapped))
+      err = GetLastError();
+    break;
+  }
+  if (r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) {
+    if (PostQueuedCompletionStatus(port(Field(v, 1)), 0, 0, &r->overlapped))
+      CAMLreturn(Val_unit);
+    else
+      err = GetLastError();
+  }
+  CAMLreturn(submitted(r, err, "overlapped_io"));
+}
+CAMLprim value iocp_completion(value v) {
+  CAMLparam1(v);
+  CAMLlocal1(result);
+  request *r = Request(v);
+  result = completion(r);
+  if (r->pending)
+    finish(r);
+  CAMLreturn(result);
+}
+
+CAMLprim value iocp_cancel(value v) {
+  request *r = Request(v);
+  if (!CancelIoEx(r->fd, &r->overlapped)) {
+    DWORD err = GetLastError();
+    if (err != ERROR_NOT_FOUND)
+      raise_win32(err, "CancelIoEx");
+  }
+  return Val_unit;
+}
 CAMLprim value iocp_dequeue(value p, value timeout) {
   CAMLparam2(p, timeout);
   port_state *state = State(p);
@@ -135,7 +282,13 @@ CAMLprim value iocp_dequeue(value p, value timeout) {
     caml_enter_blocking_section();
     BOOL ok = GetQueuedCompletionStatus(state->handle, &bytes, &key, &ol, ms);
     DWORD err = ok ? 0 : GetLastError();
-    if (ok) state->ready_id = 0;
+    if (ol) {
+      request *r = (request *)ol;
+      record_result(r, bytes, err);
+      state->ready_id = r->id;
+    } else if (ok) {
+      state->ready_id = 0;
+    }
     caml_leave_blocking_section();
     if (!ol && !ok && err != WAIT_TIMEOUT)
       raise_win32(err, "GetQueuedCompletionStatus");

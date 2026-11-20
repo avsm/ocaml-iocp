@@ -6,6 +6,7 @@
     Submitted operations root their buffers until completion. *)
 
 type port
+type operation
 
 external create_port : unit -> port = "iocp_create"
 external close_port : port -> unit = "iocp_close"
@@ -24,6 +25,17 @@ external dequeue : port -> int -> int = "iocp_dequeue"
     [acknowledge] commits delivery. Both functions require the consumer lock. *)
 
 external acknowledge : port -> unit = "iocp_acknowledge" [@@noalloc]
+external completion : operation -> completion option = "iocp_completion"
+
+external allocate : port -> int -> Unix.file_descr -> 'a -> operation
+  = "iocp_allocate"
+
+type buffer_op = Read_file | Write_file
+
+external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> unit
+  = "iocp_submit_buffer"
+
+external cancel_operation : operation -> unit = "iocp_cancel"
 
 external same_handle : Unix.file_descr -> Unix.file_descr -> bool
   = "iocp_same_handle"
