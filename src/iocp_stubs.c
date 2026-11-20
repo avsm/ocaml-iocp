@@ -104,6 +104,20 @@ CAMLprim value iocp_associate(value v, value fd) {
     raise_win32(GetLastError(), "CreateIoCompletionPort");
   return Val_unit;
 }
+CAMLprim value iocp_enable_immediate(value fd) {
+  if (Descr_kind_val(fd) == KIND_SOCKET) {
+    WSAPROTOCOL_INFOW info;
+    int len = sizeof(info);
+    if (getsockopt(Socket_val(fd), SOL_SOCKET, SO_PROTOCOL_INFOW, (char *)&info, &len) ==
+            SOCKET_ERROR)
+      raise_win32(WSAGetLastError(), "getsockopt");
+    if (!(info.dwServiceFlags1 & XP1_IFS_HANDLES))
+      return Val_false;
+  }
+  if (!SetFileCompletionNotificationModes(Handle_val(fd), FILE_SKIP_COMPLETION_PORT_ON_SUCCESS))
+    raise_win32(GetLastError(), "SetFileCompletionNotificationModes");
+  return Val_true;
+}
 
 NTSYSAPI NTSTATUS NTAPI NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
                                            FILE_INFORMATION_CLASS);
@@ -129,6 +143,9 @@ CAMLprim value iocp_wake(value v) {
    Distributed under the MIT license. See terms further down in the file.
   -----------------------------------------------------------------------*/
 
+/* Matches Raw.delivery. */
+enum delivery { NATIVE_QUEUE, POST_QUEUE, IMMEDIATE };
+
 /* Constant constructors of Raw.buffer_op come first, in declaration order. */
 enum operation_kind { OP_READ, OP_WRITE };
 
@@ -140,6 +157,7 @@ typedef struct {
   value roots;
   int pending;
   DWORD bytes;
+  enum delivery delivery;
   DWORD error;
 } request;
 #define Request(v) (*(request **)Data_custom_val(Field(v, 0)))
@@ -158,8 +176,8 @@ static struct custom_operations request_ops = {"iocp.request",
                                                custom_deserialize_default,
                                                custom_compare_ext_default,
                                                custom_fixed_length_default};
-CAMLprim value iocp_allocate(value p, value id, value fd, value buffers) {
-  CAMLparam4(p, id, fd, buffers);
+CAMLprim value iocp_allocate(value p, value id, value fd, value buffers, value delivery) {
+  CAMLparam5(p, id, fd, buffers, delivery);
   CAMLlocal2(v, storage);
   storage = caml_alloc_custom_mem(&request_ops, sizeof(request *), sizeof(request));
   *(request **)Data_custom_val(storage) = NULL;
@@ -168,6 +186,7 @@ CAMLprim value iocp_allocate(value p, value id, value fd, value buffers) {
   *(request **)Data_custom_val(storage) = r;
   r->fd = Handle_val(fd);
   r->id = Long_val(id);
+  r->delivery = Int_val(delivery);
   v = caml_alloc_tuple(4);
   Store_field(v, 0, storage);
   Store_field(v, 1, p);
@@ -212,12 +231,31 @@ static value completion(request *r) {
   Store_field(result, 2, error);
   CAMLreturn(caml_alloc_some(result));
 }
+static value complete_immediately(request *r, DWORD bytes, DWORD err) {
+  record_result(r, bytes, err);
+  finish(r);
+  return Val_true;
+}
+
 static value submitted(request *r, DWORD err, const char *op) {
   if (err != ERROR_SUCCESS && err != ERROR_IO_PENDING) {
     finish(r);
     raise_win32(err, op);
   }
-  return Val_unit;
+  if (!err && r->delivery != NATIVE_QUEUE) {
+    DWORD bytes = 0;
+    if (!GetOverlappedResult(r->fd, &r->overlapped, &bytes, FALSE))
+      err = GetLastError();
+    if (r->delivery == IMMEDIATE)
+      return complete_immediately(r, bytes, err);
+    r->error = err;
+    if (!PostQueuedCompletionStatus(port(Field(r->roots, 1)), bytes, 0, &r->overlapped)) {
+      DWORD post_error = GetLastError();
+      finish(r);
+      raise_win32(post_error, "PostQueuedCompletionStatus");
+    }
+  }
+  return Val_false;
 }
 CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) {
   CAMLparam4(v, kind, buf, offset);
@@ -245,8 +283,10 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
     break;
   }
   if (r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) {
+    if (r->delivery == IMMEDIATE)
+      CAMLreturn(complete_immediately(r, 0, 0));
     if (PostQueuedCompletionStatus(port(Field(v, 1)), 0, 0, &r->overlapped))
-      CAMLreturn(Val_unit);
+      CAMLreturn(Val_false);
     else
       err = GetLastError();
   }

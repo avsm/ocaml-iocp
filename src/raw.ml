@@ -12,6 +12,7 @@ external create_port : unit -> port = "iocp_create"
 external close_port : port -> unit = "iocp_close"
 external associate_port : port -> Unix.file_descr -> unit = "iocp_associate"
 external detach : Unix.file_descr -> unit = "iocp_detach"
+external enable_immediate : Unix.file_descr -> bool = "iocp_enable_immediate"
 external wake_port : port -> unit = "iocp_wake"
 
 type completion = {
@@ -27,12 +28,15 @@ external dequeue : port -> int -> int = "iocp_dequeue"
 external acknowledge : port -> unit = "iocp_acknowledge" [@@noalloc]
 external completion : operation -> completion option = "iocp_completion"
 
-external allocate : port -> int -> Unix.file_descr -> 'a -> operation
+type delivery = Native_queue | Post_queue | Immediate
+
+external allocate :
+  port -> int -> Unix.file_descr -> 'a -> delivery -> operation
   = "iocp_allocate"
 
 type buffer_op = Read_file | Write_file
 
-external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> unit
+external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> bool
   = "iocp_submit_buffer"
 
 external cancel_operation : operation -> unit = "iocp_cancel"

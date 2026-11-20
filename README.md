@@ -49,6 +49,12 @@ read-only file with write access, a single overlapped open sets the attribute
 at creation and preserves the creator's write access.
 Offsets are 64-bit, and append mode does not grant additional write access.
 
+`Iocp.create ~skip_on_success:true ()` avoids a completion-port round trip when
+Windows completes an operation immediately. In this mode, check `Iocp.result`
+after each submission: `Some completion` is already finished; `None` must be
+drained with `Iocp.wait`. Unsupported providers retain queued delivery. The
+default mode continues to deliver every completion through `wait`.
+
 ## Build and test
 
 ```

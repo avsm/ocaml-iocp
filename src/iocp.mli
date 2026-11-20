@@ -10,8 +10,26 @@
     {1:delivery Completion delivery}
 
     Give each outstanding operation a positive ID and use the ID to dispatch its
-    completion. Completions may arrive in any order. The port queues one
-    completion per successful submission.
+    completion. Completions may arrive in any order. The default port queues one
+    completion per successful submission. With [skip_on_success] enabled, check
+    {!result} on the returned request. [Some c] delivers the completion
+    immediately. [None] means the port delivers it through {!wait}, possibly to
+    a consumer already running on another domain. Reserve the ID and publish any
+    dispatch state before submitting.
+
+    This example uses a private port with one request and no notifications.
+    {[
+    let read_at_start port handle buf =
+      let req = Iocp.read port ~id:1 handle buf ~offset:0L in
+      let c =
+        match Iocp.result req with
+        | Some c -> c
+        | None -> Option.get (Iocp.wait port ~timeout:(-1))
+      in
+      match c.error with
+      | None -> c.bytes_transferred
+      | Some e -> raise (Unix.Unix_error (e, "read", ""))
+    ]}
 
     {1:lifetime Ownership and shutdown}
 
@@ -31,8 +49,8 @@ type handle
 (** A borrowed registration of an overlapped handle with a port. *)
 
 type request
-(** A submission token for {!cancel}. It may be discarded while the port is
-    awaiting its completion. *)
+(** A submission token for {!cancel} and {!result}. It may be discarded while
+    the port is awaiting its completion. *)
 
 type completion = {
   id : int;  (** Identifies the request, or is zero for a notification. *)
@@ -45,8 +63,10 @@ type completion = {
 
 (** {1 Completion ports} *)
 
-val create : unit -> t
-(** Create a port. {!wait} delivers every completion. *)
+val create : ?skip_on_success:bool -> unit -> t
+(** Create a port. By default, {!wait} delivers every completion. If
+    [skip_on_success] is true, supported handles deliver immediate completions
+    through {!result}. Check {!result} after every submission in this mode. *)
 
 val close : t -> unit
 (** Close the port. Repeated calls have no effect. Raise [Invalid_argument] if a
@@ -66,7 +86,10 @@ val register : t -> Unix.file_descr -> handle
     associated.
 
     Start with no outstanding external I/O. While registered, submit overlapped
-    operations exclusively through this library, including through aliases. *)
+    operations exclusively through this library, including through aliases. The
+    first submission can enable Windows' skip-on-success notification mode even
+    for a port using queued delivery. Windows retains this mode after detach. A
+    subsequent native consumer must handle synchronous success itself. *)
 
 val close_handle : handle -> unit
 (** Close a registration. Repeated calls have no effect. Raise
@@ -86,6 +109,12 @@ val wait : t -> timeout:int -> completion option
     timeouts must not exceed [0xffff_fffe]. Sequential calls may use different
     OS threads. If constructing the completion raises [Out_of_memory], retry
     [wait] to collect the same packet. *)
+
+val result : request -> completion option
+(** Return an immediate completion, if one was produced during submission.
+    Otherwise return [None], even if {!wait} has since consumed the completion.
+    Immediate completions are not queued and do not count towards {!pending}. If
+    constructing the result raises [Out_of_memory], call [result] again. *)
 
 val cancel : t -> request -> unit
 (** Request cancellation. Cancellation may race with successful completion. A
