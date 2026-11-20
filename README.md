@@ -2,7 +2,7 @@
 
 Windows 10 and later I/O completion ports for OCaml 5.2 and later.
 
-The library provides file and pipe reads/writes, socket send/receive,
+The library provides file and pipe reads/writes, socket and datagram send/receive,
 AcceptEx, ConnectEx, cancellation, and cross-thread notifications. Request IDs
 are ordinary positive integers. Buffers and request storage remain rooted until
 completion is consumed, including when cancellation races with successful I/O.

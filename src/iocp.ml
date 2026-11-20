@@ -8,6 +8,7 @@ type completion = Raw.completion = {
   id : int;
   bytes_transferred : int;
   error : Unix.error option;
+  source : Unix.sockaddr option;
 }
 
 type t = {
@@ -134,7 +135,8 @@ let cancel_all t =
       check t;
       Hashtbl.iter (fun _ r -> Raw.cancel_operation r.operation) t.requests)
 
-let notification = Some { id = 0; bytes_transferred = 0; error = None }
+let notification =
+  Some { id = 0; bytes_transferred = 0; error = None; source = None }
 
 let wait t ~timeout =
   if timeout < -1 || Int64.of_int timeout > 0xffff_fffeL then
@@ -213,13 +215,17 @@ let result r = if r.immediate then Raw.completion r.operation false else None
 let buffer kind t ~id fd buf ~offset =
   if offset < 0L && not (kind = Raw.Write_file && offset = -1L) then
     invalid_arg "Iocp: negative offset";
-  submit ~receive:(kind = Raw.Recv) t ~id fd buf (fun op ->
-      Raw.submit_buffer op kind buf offset)
+  submit
+    ~receive:(kind = Raw.Recv || kind = Raw.Recv_from)
+    t ~id fd buf
+    (fun op -> Raw.submit_buffer op kind buf offset)
 
 let read = buffer Raw.Read_file
 let write = buffer Raw.Write_file
 let recv t ~id fd buf = buffer Raw.Recv t ~id fd buf ~offset:0L
 let send t ~id fd buf = buffer Raw.Send t ~id fd buf ~offset:0L
+let recvfrom t ~id fd buf = buffer Raw.Recv_from t ~id fd buf ~offset:0L
+let sendto t ~id fd buf addr = buffer (Raw.Send_to addr) t ~id fd buf ~offset:0L
 
 let accept t ~id fd ~client =
   submit t ~id fd client (fun op -> Raw.submit_accept op client)

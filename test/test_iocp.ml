@@ -251,6 +251,33 @@ let receive_shutdown ~duplicate () =
   check "unrelated request" 2 c.id;
   assert (c.error <> None)
 
+let shutdown_preserves_error () =
+  List.iter
+    (fun skip_on_success ->
+      let p = Iocp.create ~skip_on_success () in
+      let r = Unix.socket ~cloexec:true PF_INET SOCK_DGRAM 0 in
+      let w = Unix.socket ~cloexec:true PF_INET SOCK_DGRAM 0 in
+      Fun.protect ~finally:(fun () ->
+          close_fd r;
+          close_fd w;
+          close_port p)
+      @@ fun () ->
+      Unix.bind r (ADDR_INET (Unix.inet_addr_loopback, 0));
+      Unix.bind w (ADDR_INET (Unix.inet_addr_loopback, 0));
+      ignore (Iocp.recvfrom p ~id:1 (handle p r) (Cstruct.create 1));
+      let addr = Unix.getsockname r in
+      ignore (Unix.sendto w (Bytes.make 1024 'x') 0 1024 [] addr);
+      ignore (Unix.sendto w (Bytes.of_string "done") 0 4 [] addr);
+      let marker = Bytes.create 4 in
+      check "marker length" 4 (fst (Unix.recvfrom r marker 0 4 []));
+      Alcotest.(check string) "marker" "done" (Bytes.to_string marker);
+      Iocp.shutdown p (handle p r) Unix.SHUTDOWN_RECEIVE;
+      let c = status p in
+      assert (c.error = Some Unix.EMSGSIZE);
+      check "partial receive" 1 c.bytes_transferred;
+      assert (c.source = Some (Unix.getsockname w)))
+    [ false; true ]
+
 (* Model a failure while converting a dequeued packet, before delivery commits. *)
 let retry_delivery () =
   let p = Raw.create_port () in
@@ -382,6 +409,55 @@ let append_access () =
   with
   | _ -> Alcotest.fail "append granted write access to a read-only handle"
   | exception Unix.Unix_error _ -> check "rollback" 0 (Iocp.pending p)
+
+let datagrams () =
+  let a = Unix.socket ~cloexec:true PF_INET SOCK_DGRAM 0 in
+  let b = Unix.socket ~cloexec:true PF_INET SOCK_DGRAM 0 in
+  Fun.protect ~finally:(fun () ->
+      close_fd a;
+      close_fd b)
+  @@ fun () ->
+  Unix.bind a (ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.bind b (ADDR_INET (Unix.inet_addr_loopback, 0));
+  with_port @@ fun p ->
+  let cancelled = Iocp.recvfrom p ~id:1 (handle p a) (Cstruct.create 5) in
+  Gc.full_major ();
+  Iocp.cancel p cancelled;
+  assert ((status p).error <> None);
+  List.iter
+    (fun msg ->
+      let buf = Cstruct.create 5 in
+      ignore (Iocp.recvfrom p ~id:2 (handle p a) buf);
+      ignore
+        (Iocp.sendto p ~id:3 (handle p b) (Cstruct.of_string msg)
+           (Unix.getsockname a));
+      let x = status p and y = status p in
+      assert (x.error = None && y.error = None);
+      let received = if x.id = 2 then x else y in
+      check "datagram length" (String.length msg) received.bytes_transferred;
+      assert (received.source = Some (Unix.getsockname b));
+      Alcotest.(check string)
+        "datagram contents" msg
+        (Cstruct.to_string (Cstruct.sub buf 0 received.bytes_transferred)))
+    [ "hello"; "" ]
+
+let buffered_truncation () =
+  List.iter
+    (fun skip_on_success ->
+      let udp () = Unix.socket ~cloexec:true PF_INET SOCK_DGRAM 0 in
+      let r = udp () and w = udp () in
+      Fun.protect ~finally:(fun () -> close_fd r; close_fd w) @@ fun () ->
+      List.iter (fun s -> Unix.bind s (ADDR_INET (Unix.inet_addr_loopback, 0))) [ r; w ];
+      with_port ~skip_on_success @@ fun p ->
+      ignore (Unix.sendto w (Bytes.of_string "abc") 0 3 [] (Unix.getsockname r));
+      let buf = Cstruct.create 1 in
+      let req = Iocp.recvfrom p ~id:1 (handle p r) buf in
+      let c = match Iocp.result req with Some c -> c | None -> status p in
+      assert (c.error = Some Unix.EMSGSIZE);
+      assert (c.source = Some (Unix.getsockname w));
+      check "copied bytes" 1 c.bytes_transferred;
+      Alcotest.(check string) "prefix" "a" (Cstruct.to_string buf))
+    [ false; true ]
 
 let cancel_write () =
   with_pipe @@ fun p _r w ->
@@ -726,6 +802,7 @@ let () =
             ("registration reuse across modes", registration_reuse);
             ("foreign alias after handle reuse", foreign_alias_reuse);
             ("immediate completion without duplicates", immediate);
+            ("datagrams and cancellation", datagrams);
             ("cancel blocked pipe write", cancel_write);
             ("pipe EOF", pipe_eof);
             ("append preserves access", append_access);
@@ -736,6 +813,8 @@ let () =
             ("wrong-port cancellation", wrong_port);
             ("sequential consumer handover", consumer_handover);
             ("retry unacknowledged delivery", retry_delivery);
+            ("shutdown preserves queued errors", shutdown_preserves_error);
+            ("buffered datagram truncation", buffered_truncation);
             ("receive shutdown", receive_shutdown ~duplicate:false);
             ("receive shutdown through dup", receive_shutdown ~duplicate:true);
             ("file and 64-bit offset", file);
