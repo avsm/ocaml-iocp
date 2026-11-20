@@ -4,6 +4,7 @@
    Distributed under the MIT license. See terms at the end of this file.
   ----------------------------------------------------------------------*)
 
+module Port = Port
 module Handle = Handle
 module Overlapped = Overlapped
 module Native = Raw

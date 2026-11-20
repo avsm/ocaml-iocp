@@ -6,6 +6,7 @@
     Bindings to input/output completion ports (IOCP) allowing for efficient,
     asynchronous IO on Windows. *)
 
+module Port = Port
 module Overlapped = Overlapped
 module Handle = Handle
 module Raw = Prototype_raw

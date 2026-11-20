@@ -1,8 +1,150 @@
 (* Copyright (c) 2026 Anil Madhavapeddy <anil@recoil.org>
    SPDX-License-Identifier: MIT *)
 
+module Iocp = struct
+  include Iocp.Port
+
+  let openfile = Iocp.openfile
+  let pipe = Iocp.pipe
+end
+
+let registrations_lock = Mutex.create ()
+let registrations = ref []
+
+let handle p fd =
+  let h = Iocp.register p fd in
+  Mutex.protect registrations_lock (fun () ->
+      registrations := (p, fd, h) :: !registrations);
+  h
+
+let release_matching predicate =
+  let selected =
+    Mutex.protect registrations_lock (fun () ->
+        let selected, remaining = List.partition predicate !registrations in
+        registrations := remaining;
+        selected)
+  in
+  List.iter (fun (_, _, h) -> Iocp.close_handle h) selected
+
+let close_fd fd =
+  release_matching (fun (_, original, _) -> original == fd);
+  Unix.close fd
+
+let close_port p =
+  release_matching (fun (owner, _, _) -> owner == p);
+  Iocp.close p
+
+let associate p fd = ignore (handle p fd)
 let check = Alcotest.(check int)
-let close_fd = Unix.close
+
+let status p =
+  match Iocp.wait p ~timeout:10000 with
+  | Some x -> x
+  | None -> Alcotest.fail "completion timed out"
+
+let success p id bytes =
+  let c = status p in
+  check "id" id c.id;
+  check "bytes" bytes c.bytes_transferred;
+  match c.error with
+  | None -> ()
+  | Some e -> Alcotest.fail (Unix.error_message e)
+
+let with_port fn =
+  let p = Iocp.create () in
+  Fun.protect ~finally:(fun () -> close_port p) (fun () -> fn p)
+
+let with_pipe fn =
+  let r, w = Iocp.pipe () in
+  Fun.protect
+    ~finally:(fun () ->
+      close_fd r;
+      close_fd w)
+    (fun () -> with_port (fun p -> fn p r w))
+
+let invalid fn =
+  match fn () with
+  | () -> Alcotest.fail "expected Invalid_argument"
+  | exception Invalid_argument _ -> ()
+
+let wake () =
+  with_port @@ fun p ->
+  assert (Iocp.wait p ~timeout:0 = None);
+  let d = Domain.spawn (fun () -> Iocp.wake p) in
+  success p 0 0;
+  Domain.join d
+
+let consumer_handover () =
+  let run wake wait =
+    let gate = Atomic.make false in
+    let finished = Atomic.make false in
+    let worker =
+      Domain.spawn (fun () ->
+          while not (Atomic.get gate) do
+            Domain.cpu_relax ()
+          done;
+          let result = wait 100 in
+          Atomic.set finished true;
+          result)
+    in
+    wake ();
+    assert (wait 100);
+    wake ();
+    Atomic.set gate true;
+    while not (Atomic.get finished) do
+      Domain.cpu_relax ()
+    done;
+    assert (Domain.join worker);
+    assert (not (wait 0))
+  in
+  with_port (fun p ->
+      run (fun () -> Iocp.wake p) (fun timeout -> Iocp.wait p ~timeout <> None))
+
+let closed_port () =
+  let p = Iocp.create () in
+  close_port p;
+  close_port p;
+  invalid (fun () -> Iocp.wake p);
+  invalid (fun () -> ignore (Iocp.wait p ~timeout:0))
+
+let failed_registration () =
+  let sync, writer = Iocp.pipe ~read_async:false () in
+  Fun.protect ~finally:(fun () ->
+      Unix.close sync;
+      Unix.close writer)
+  @@ fun () ->
+  with_port @@ fun p ->
+  (match Iocp.register p sync with
+  | _ -> Alcotest.fail "registered a synchronous pipe for overlapped I/O"
+  | exception Unix.Unix_error _ -> ());
+  Iocp.close_handle (Iocp.register p writer)
+
+let association_ownership () =
+  with_pipe @@ fun p r _w ->
+  associate p r;
+  associate p r;
+  with_port @@ fun other ->
+  match associate other r with
+  | () -> Alcotest.fail "associated a handle with two ports"
+  | exception Unix.Unix_error (EINVAL, _, _) -> ()
+
+let with_registration p fd fn =
+  let h = Iocp.register p fd in
+  Fun.protect ~finally:(fun () -> Iocp.close_handle h) (fun () -> fn h)
+
+let foreign_alias_reuse () =
+  with_pipe @@ fun p target _ ->
+  with_pipe @@ fun q source _ ->
+  with_registration p target @@ fun old ->
+  Iocp.close_handle old;
+  with_registration q source @@ fun _ ->
+  Unix.dup2 source target;
+  Unix.dup2 source target;
+  match Iocp.register p target with
+  | h ->
+      Iocp.close_handle h;
+      Alcotest.fail "accepted a foreign alias"
+  | exception Unix.Unix_error (EINVAL, _, _) -> ()
 
 let creation_permissions () =
   let run mode (exists, was_readonly, flags) =
@@ -58,19 +200,6 @@ let creation_permissions () =
         ])
     [ Unix.O_RDONLY; O_WRONLY; O_RDWR ]
 
-let ports () =
-  let p = Raw.create_port () in
-  Fun.protect ~finally:(fun () -> Raw.close_port p) @@ fun () ->
-  let r, w = Iocp.pipe () in
-  Fun.protect ~finally:(fun () -> Unix.close r; Unix.close w) @@ fun () ->
-  assert (Raw.same_handle r r);
-  Raw.associate_port p r;
-  Raw.detach r;
-  Raw.wake_port p;
-  check "notification" 0 (Raw.dequeue p 1000);
-  Raw.acknowledge p;
-  check "empty queue" (-1) (Raw.dequeue p 0)
-
 (* Model a failure while converting a dequeued packet, before delivery commits. *)
 let retry_delivery () =
   let p = Raw.create_port () in
@@ -100,4 +229,20 @@ let retry_delivery () =
   Raw.acknowledge p;
   check "queue drained" (-1) (Raw.dequeue p 0)
 
-let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "creation permissions" `Quick creation_permissions ]; "ports", [ Alcotest.test_case "port lifecycle" `Quick ports; Alcotest.test_case "retry delivery" `Quick retry_delivery ] ]
+let () =
+  Alcotest.run "iocp"
+    [
+      ( "ports",
+        List.map
+          (fun (n, f) -> Alcotest.test_case n `Quick f)
+          [
+            ("closed port", closed_port);
+            ("cross-domain wake", wake);
+            ("consumer handover", consumer_handover);
+            ("association ownership", association_ownership);
+            ("failed registration", failed_registration);
+            ("foreign alias after handle reuse", foreign_alias_reuse);
+            ("retry delivery", retry_delivery);
+            ("file creation permissions", creation_permissions);
+          ] );
+    ]
