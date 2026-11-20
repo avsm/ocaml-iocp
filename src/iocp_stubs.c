@@ -112,3 +112,42 @@ CAMLprim value iocp_create_readonly(value path, value access, value append,
   Handle_val(result) = h;
   CAMLreturn(result);
 }
+
+CAMLprim value iocp_pipe(value read_async, value write_async, value message) {
+  CAMLparam3(read_async, write_async, message);
+  CAMLlocal3(result, rd, wr);
+  rd = caml_win32_alloc_handle(INVALID_HANDLE_VALUE);
+  wr = caml_win32_alloc_handle(INVALID_HANDLE_VALUE);
+  result = caml_alloc_tuple(2);
+  Store_field(result, 0, rd);
+  Store_field(result, 1, wr);
+  unsigned long long random[2];
+  NTSTATUS status =
+      BCryptGenRandom(NULL, (PUCHAR)random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (status != 0)
+    caml_failwith("Iocp.pipe: BCryptGenRandom failed");
+  wchar_t name[96];
+  swprintf(name, 96, L"\\\\.\\pipe\\ocaml-iocp-%016llx%016llx", random[0], random[1]);
+  DWORD rf = Bool_val(read_async) ? FILE_FLAG_OVERLAPPED : 0;
+  DWORD wf = Bool_val(write_async) ? FILE_FLAG_OVERLAPPED : 0;
+  DWORD mode = Bool_val(message) ? PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE : PIPE_TYPE_BYTE;
+  caml_enter_blocking_section();
+  HANDLE r = CreateNamedPipeW(name, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | rf,
+                              mode | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536,
+                              65536, 0, NULL);
+  DWORD err = r == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+  HANDLE w = INVALID_HANDLE_VALUE;
+  if (!err) {
+    w = CreateFileW(name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, wf, NULL);
+    if (w == INVALID_HANDLE_VALUE) {
+      err = GetLastError();
+      CloseHandle(r);
+    }
+  }
+  caml_leave_blocking_section();
+  if (err)
+    raise_win32(err, "Iocp.pipe");
+  Handle_val(rd) = r;
+  Handle_val(wr) = w;
+  CAMLreturn(result);
+}

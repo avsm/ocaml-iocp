@@ -21,6 +21,14 @@ let delete_sharing () =
   in
   List.iter (fun perm -> List.iter (run perm) [false; true]) [0o600; 0o400]
 
+let pipe_modes () =
+  List.iter (fun message ->
+      let r, w = Iocp.pipe ~read_async:false ~write_async:false ~message () in
+      Fun.protect ~finally:(fun () -> Unix.close r; Unix.close w) @@ fun () ->
+      let buf = Bytes.create 1 in
+      assert (Unix.write_substring w "x" 0 1 = 1);
+      assert (Unix.read r buf 0 1 = 1 && Bytes.get buf 0 = 'x')) [false; true]
+
 let creation_permissions () =
   let run mode (exists, was_readonly, flags) =
     let reference = Filename.temp_file "unix-perm" ".tmp" in
@@ -75,4 +83,4 @@ let creation_permissions () =
         ])
     [ Unix.O_RDONLY; O_WRONLY; O_RDWR ]
 
-let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "file delete sharing" `Quick delete_sharing; Alcotest.test_case "creation permissions" `Quick creation_permissions ] ]
+let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "pipe modes" `Quick pipe_modes; Alcotest.test_case "file delete sharing" `Quick delete_sharing; Alcotest.test_case "creation permissions" `Quick creation_permissions ] ]

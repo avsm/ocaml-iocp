@@ -48,6 +48,9 @@ let openfile path flags perm =
     Unix.close fd;
     raise ex
 
+let pipe ?(read_async = true) ?(write_async = true) ?(message = false) () =
+  Raw.pipe_raw read_async write_async ~message
+
 (*---------------------------------------------------------------------------
   Copyright (c) 2022 <patrick@sirref.org>
 

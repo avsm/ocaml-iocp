@@ -13,3 +13,6 @@ external create_readonly :
   = "iocp_create_readonly"
 (** A later reopen for write access would be denied by the read-only attribute.
 *)
+
+external pipe_raw : bool -> bool -> message:bool -> Unix.file_descr * Unix.file_descr
+  = "iocp_pipe"

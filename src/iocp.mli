@@ -12,3 +12,16 @@ val openfile :
     [O_KEEPEXEC] without [O_CLOEXEC]. Creation applies the requested Windows
     read-only attribute when opening the file. Append restricts writable handles
     to appending. Read-only handles keep their original access. *)
+
+val pipe :
+  ?read_async:bool ->
+  ?write_async:bool ->
+  ?message:bool ->
+  unit ->
+  Unix.file_descr * Unix.file_descr
+(** Create a private, non-inheritable pipe and return its read and write
+    ends. The caller closes both with [Unix.close]. Both support overlapped I/O
+    by default. Set an end's option to false for synchronous child standard I/O.
+    Only asynchronous ends may use a port. The default pipe is a byte stream.
+    With [message:true], each write is a message and reads retain message
+    boundaries. *)
