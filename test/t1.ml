@@ -264,11 +264,12 @@ let error_out_of_bounds () =
   let handle = Iocp.Raw.openfile iocp 1 filename Unix.[ O_RDONLY ] 0 in
   let buf = Cstruct.create 1 in
   let ol = Iocp.Overlapped.create ~off:(Optint.Int63.of_int 1024) () in
-  let () = Iocp.Raw.read iocp handle (Cstruct.to_bigarray buf) 1 0 ol in
-  match Iocp.Raw.get_queued_completion_status iocp 1000 with
-  | Cs_none -> assert false
-  | Cs_some t -> ( match t.error with None -> assert false | Some _e -> ())
-
+  match Iocp.Raw.read iocp handle (Cstruct.to_bigarray buf) 1 0 ol with
+  | exception Unix.Unix_error (Unix.EUNKNOWNERR (-38), "ReadFile", _) -> ()
+  | () ->
+      match Iocp.Raw.get_queued_completion_status iocp 1000 with
+      | Cs_none -> assert false
+      | Cs_some t -> assert (t.error <> None && t.bytes_transferred = 0)
 
 let safest () =
   let iocp = Iocp.create 10 in
