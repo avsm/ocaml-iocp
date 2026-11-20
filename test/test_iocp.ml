@@ -83,4 +83,17 @@ let creation_permissions () =
         ])
     [ Unix.O_RDONLY; O_WRONLY; O_RDWR ]
 
-let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "pipe modes" `Quick pipe_modes; Alcotest.test_case "file delete sharing" `Quick delete_sharing; Alcotest.test_case "creation permissions" `Quick creation_permissions ] ]
+let ports () =
+  let p = Raw.create_port () in
+  Fun.protect ~finally:(fun () -> Raw.close_port p) @@ fun () ->
+  let r, w = Iocp.pipe () in
+  Fun.protect ~finally:(fun () -> Unix.close r; Unix.close w) @@ fun () ->
+  assert (Raw.same_handle r r);
+  Raw.associate_port p r;
+  Raw.detach r;
+  Raw.wake_port p;
+  check "notification" 0 (Raw.dequeue p 1000);
+  Raw.acknowledge p;
+  check "empty queue" (-1) (Raw.dequeue p 0)
+
+let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "pipe modes" `Quick pipe_modes; Alcotest.test_case "file delete sharing" `Quick delete_sharing; Alcotest.test_case "creation permissions" `Quick creation_permissions ]; "ports", [ Alcotest.test_case "port lifecycle" `Quick ports ] ]
