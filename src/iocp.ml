@@ -4,77 +4,180 @@
    Distributed under the MIT license. See terms at the end of this file.
   ----------------------------------------------------------------------*)
 
-module Port = Port
-module Handle = Handle
-module Overlapped = Overlapped
-module Native = Raw
-module Raw = Prototype_raw
-
-module Id = struct
-  type t = int
-  let compare : t -> t -> int = Int.compare
-  let hash : t -> int = Hashtbl.hash
-  let equal : t -> t -> bool = Int.equal
-  let to_int (a:int) = a
-end
-
-type fd = Handle.t
-
-module H = Hashtbl.Make(Id)
-
-type roots =
-  | ReadWrite of Cstruct.buffer
-
-type t = {
-  iocp : Raw.t;
-  m : Mutex.t;
-  mutable external_key : int;
-  in_flight : (Handle.t * int Overlapped.t * roots * int) H.t;
-  mutable unused_overlapped : int Overlapped.t list;
-  allocated_overlapped : int Overlapped.t array;
-  external_keys : int array;
-}
-
-type completion_status = {
+type completion = Raw.completion = {
+  id : int;
   bytes_transferred : int;
-  id : Id.t;
   error : Unix.error option;
 }
 
-exception Out_of_overlapped
+type t = {
+  port : Raw.port;
+  lock : Mutex.t;
+  requests : (int, request) Hashtbl.t;
+  mutable registered : int;
+  mutable closed : bool;
+  mutable waiting : bool;
+}
 
-let create ?(overlapped = 1024) n =
-  let allocated_overlapped = Array.init overlapped (fun i -> Overlapped.create i) in
-  let external_keys = Array.init overlapped (fun _ -> -1) in
-  let unused_overlapped = Array.to_list allocated_overlapped in
-  (* Format.eprintf "All created\n%!"; *)
-  { iocp = Raw.create_io_completion_port n
-  ; m = Mutex.create ()
-  ; in_flight = H.create 255
-  ; external_key = 1
-  ; unused_overlapped
-  ; allocated_overlapped
-  ; external_keys }
+and association = { port_state : t; mutable handles : handle list }
 
-let handle_of_fd v fd key =
-  Raw.associate_fd_with_iocp v.iocp fd key
+and handle = {
+  association : association;
+  fd : Unix.file_descr;
+  mutable pending : int;
+  mutable released : bool;
+}
 
-let get_overlapped v fd root =
-  Mutex.lock v.m;
-  match v.unused_overlapped with
-  | [] -> Mutex.unlock v.m; raise Out_of_overlapped
-  | ol :: ols ->
-    (* Format.eprintf "Getting overlapped\n%!"; *)
-    let id = Overlapped.id ol in
-    let external_key = v.external_key in
-    let key = Overlapped.get_key ol in
-    v.external_key <- external_key + 1;
-    v.external_keys.(key) <- external_key;
-    v.unused_overlapped <- ols;
-    H.replace v.in_flight id (fd, ol, root, external_key);
-    Mutex.unlock v.m;
-    (* Format.eprintf "Found an overlapped: id=%d external_key=%d internal_key=%d\n%!" id external_key key; *)
-    ol, external_key
+and request = {
+  operation : Raw.operation;
+  id : int;
+  owner : Raw.port;
+  handle : handle;
+}
+
+let association_lock = Mutex.create ()
+let associations : association list ref = ref []
+let locked t fn = Mutex.protect t.lock fn
+let check t = if t.closed then invalid_arg "Iocp: closed port"
+
+let create () =
+  {
+    port = Raw.create_port ();
+    registered = 0;
+    lock = Mutex.create ();
+    requests = Hashtbl.create 16;
+    closed = false;
+    waiting = false;
+  }
+
+let pending t = locked t (fun () -> Hashtbl.length t.requests)
+
+let close t =
+  locked t (fun () ->
+      if not t.closed then (
+        if t.waiting || t.registered <> 0 || Hashtbl.length t.requests <> 0 then
+          invalid_arg "Iocp.close: port is busy";
+        Raw.close_port t.port;
+        t.closed <- true))
+
+let check_handle t h =
+  check t;
+  if h.released then invalid_arg "Iocp: closed handle";
+  if h.association.port_state != t then invalid_arg "Iocp: wrong port"
+
+let register t fd =
+  locked t (fun () ->
+      check t;
+      Mutex.protect association_lock (fun () ->
+          let found =
+            List.find_opt
+              (fun a -> Raw.same_handle fd (List.hd a.handles).fd)
+              !associations
+          in
+          let a =
+            match found with
+            | Some a when a.port_state == t -> a
+            | Some _ -> raise (Unix.Unix_error (EINVAL, "Iocp.register", ""))
+            | None -> { port_state = t; handles = [] }
+          in
+          let h = { association = a; fd; pending = 0; released = false } in
+          let handles = h :: a.handles in
+          (match found with
+          | Some _ -> ()
+          | None ->
+              let all = a :: !associations in
+              Raw.associate_port t.port fd;
+              associations := all);
+          a.handles <- handles;
+          t.registered <- t.registered + 1;
+          h))
+
+let close_handle h =
+  let a = h.association in
+  locked a.port_state (fun () ->
+      if not h.released then (
+        if h.pending <> 0 then invalid_arg "Iocp.close_handle: handle is busy";
+        Mutex.protect association_lock (fun () ->
+            let remaining = List.filter (fun other -> other != h) a.handles in
+            if remaining = [] then (
+              let all = List.filter (fun other -> other != a) !associations in
+              Raw.detach h.fd;
+              associations := all);
+            a.handles <- remaining;
+            h.released <- true;
+            a.port_state.registered <- a.port_state.registered - 1)))
+
+let wake t =
+  locked t (fun () ->
+      check t;
+      Raw.wake_port t.port)
+
+let cancel t r =
+  locked t (fun () ->
+      check t;
+      if r.owner != t.port then invalid_arg "Iocp.cancel: wrong port";
+      match Hashtbl.find_opt t.requests r.id with
+      | Some current when current == r -> Raw.cancel_operation r.operation
+      | _ -> ())
+
+let cancel_all t =
+  locked t (fun () ->
+      check t;
+      Hashtbl.iter (fun _ r -> Raw.cancel_operation r.operation) t.requests)
+
+let notification = Some { id = 0; bytes_transferred = 0; error = None }
+
+let wait t ~timeout =
+  if timeout < -1 || Int64.of_int timeout > 0xffff_fffeL then
+    invalid_arg "Iocp.wait: timeout";
+  let claimed = ref false in
+  let release () = t.waiting <- false in
+  Fun.protect ~finally:(fun () -> if !claimed then locked t release)
+  @@ fun () ->
+  locked t (fun () ->
+      check t;
+      if t.waiting then invalid_arg "Iocp.wait: concurrent consumer";
+      t.waiting <- true;
+      claimed := true);
+  match Raw.dequeue t.port timeout with
+  | -1 -> None
+  | 0 ->
+      Raw.acknowledge t.port;
+      notification
+  | id ->
+      locked t (fun () ->
+          let r = Hashtbl.find t.requests id in
+          let result = Raw.completion r.operation in
+          Hashtbl.remove t.requests id;
+          r.handle.pending <- r.handle.pending - 1;
+          Raw.acknowledge t.port;
+          result)
+
+let submit t ~id h roots fn =
+  locked t (fun () ->
+      check_handle t h;
+      if id <= 0 || Hashtbl.mem t.requests id then
+        invalid_arg "Iocp: duplicate or non-positive request ID";
+      let operation = Raw.allocate t.port id h.fd (h, roots) in
+      let r = { operation; id; owner = t.port; handle = h } in
+      h.pending <- h.pending + 1;
+      match
+        Hashtbl.add t.requests id r;
+        fn operation
+      with
+      | () -> r
+      | exception ex ->
+          h.pending <- h.pending - 1;
+          Hashtbl.remove t.requests id;
+          raise ex)
+
+let buffer kind t ~id fd buf ~offset =
+  if offset < 0L && not (kind = Raw.Write_file && offset = -1L) then
+    invalid_arg "Iocp: negative offset";
+  submit t ~id fd buf (fun op -> Raw.submit_buffer op kind buf offset)
+
+let read = buffer Raw.Read_file
+let write = buffer Raw.Write_file
 
 let openfile path flags perm =
   let has f = List.mem f flags in
@@ -86,9 +189,9 @@ let openfile path flags perm =
       | _ -> invalid_arg "Iocp.openfile: unsupported flag")
     flags;
   let mode, access =
-    if has Unix.O_RDWR then (Unix.O_RDWR, Native.Read_write)
-    else if has O_WRONLY then (Unix.O_WRONLY, Native.Write)
-    else (Unix.O_RDONLY, Native.Read)
+    if has Unix.O_RDWR then (Unix.O_RDWR, Raw.Read_write)
+    else if has O_WRONLY then (Unix.O_WRONLY, Raw.Write)
+    else (Unix.O_RDONLY, Raw.Read)
   in
   let open_flags =
     List.filter
@@ -101,14 +204,14 @@ let openfile path flags perm =
   in
   let open_flags = Unix.O_CLOEXEC :: mode :: open_flags in
   let fd =
-    if access <> Native.Read && has O_CREAT && perm land 0o200 = 0 then
-      Native.create_readonly path access (has O_APPEND) ~exclusive:(has O_EXCL)
+    if access <> Raw.Read && has O_CREAT && perm land 0o200 = 0 then
+      Raw.create_readonly path access (has O_APPEND) ~exclusive:(has O_EXCL)
         ~truncate:(has O_TRUNC)
     else
       let original = Unix.openfile path open_flags perm in
       Fun.protect
         ~finally:(fun () -> Unix.close original)
-        (fun () -> Native.reopen original access (has O_APPEND))
+        (fun () -> Raw.reopen original access (has O_APPEND))
   in
   try
     if has O_KEEPEXEC && not (has O_CLOEXEC) then Unix.clear_close_on_exec fd;
@@ -118,68 +221,7 @@ let openfile path flags perm =
     raise ex
 
 let pipe ?(read_async = true) ?(write_async = true) () =
-  Native.pipe_raw read_async write_async
-
-let read : t -> Handle.t -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t =
-  fun v fd buf ~pos ~len ~off ->
-    let root = ReadWrite buf in
-    let ol, external_key = get_overlapped v fd root in
-    Overlapped.set_offset ol off;
-    Raw.read v.iocp fd buf len pos ol;
-    external_key
-
-let write : t -> Handle.t -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t =
-  fun v fd buf ~pos ~len ~off -> 
-    let root = ReadWrite buf in
-    let ol, external_key = get_overlapped v fd root in
-    Overlapped.set_offset ol off;
-    Raw.write v.iocp fd buf len pos ol;
-    external_key
-
-let completion_status : t -> timeout:int -> completion_status option =
-  fun v ~timeout ->
-    match Raw.get_queued_completion_status v.iocp timeout with
-    | Raw.Cs_none -> None
-    | Raw.Cs_some cs ->
-      Mutex.lock v.m;
-      (* let (_buf, _ol) = H.find v.in_flight cs.overlapped_id in *)
-      H.remove v.in_flight cs.overlapped_id;
-      let ol_key = Overlapped.unsafe_key cs.overlapped_id in
-      let external_key = v.external_keys.(ol_key) in
-      v.unused_overlapped <- v.allocated_overlapped.(ol_key) :: v.unused_overlapped;
-      Mutex.unlock v.m;
-      Some { bytes_transferred = cs.bytes_transferred
-          ; id = external_key
-          ; error = cs.error }
-
-let garbage = Atomic.make []
-
-let finaliser v =
-  (* Format.eprintf "Finaliser for Safest.t\n%!"; *)
-  H.iter (fun _ (fd, ol, _, _) ->
-    Format.eprintf "Cancelling somthing\n%!";
-    Raw.cancel fd ol) v.in_flight;
-  let rec loop () =
-    if (H.length v.in_flight = 0) then ( (*Format.eprintf "All done\n%!" *) ()) else begin
-      Format.eprintf "Something to wait for\n%!";
-      match completion_status v ~timeout:100 with
-      | None ->
-        Format.eprintf "Error, failed to cancel some outstanding operations (%d)" (H.length v.in_flight);
-        let rec add_to_garbage () =
-          let cur = Atomic.get garbage in
-          if Atomic.compare_and_set garbage cur (v :: cur)
-          then ()
-          else add_to_garbage ()
-        in
-        add_to_garbage ()
-      | _ -> loop ()
-      end
-    in loop ()
-
-let create n =
-  let v = create n in
-  Gc.finalise finaliser v;
-  v
+  Raw.pipe_raw read_async write_async
 
 (*---------------------------------------------------------------------------
   Copyright (c) 2022 <patrick@sirref.org>

@@ -1,32 +1,65 @@
-# ocaml-iocp -- bindings to Windows IOCP
+# ocaml-iocp
 
-These are OCaml bindings for Windows' [input/output completion ports](https://docs.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports).
+Windows 10 and later I/O completion ports for OCaml 5.2 and later.
 
-## Usage
+The library provides file and pipe reads/writes, cancellation, and cross-thread notifications. Request IDs
+are ordinary positive integers. Buffers and request storage remain rooted until
+completion is consumed, including when cancellation races with successful I/O.
+There is no fixed limit on the number of outstanding requests.
 
-To read a file, you first create a completion port, then open the file using the `Iocp.Handle` module. This ensures the file handle has `FILE_FLAG_OVERLAPPED` set. You can then perform the asynchronous read and wait on the completion port to return the result to you. By default, the completion status will wait indefinitely for a completion packet to arrive.
+## Ownership
 
-This program copies a file.
+- Use one completion consumer per port. Submission and cancellation are thread-safe.
+- Call `Iocp.register port fd` before submitting I/O. The returned handle borrows
+  the descriptor; keep it open and unchanged until `Iocp.close_handle` returns.
+- Aliases can register with the same port. Registering an alias with another port
+  fails while any registration remains open. Closing the last registration
+  detaches the object, allowing it to be registered again later.
+- Descriptors must support overlapped I/O. Do not change their completion
+  notification modes or issue overlapped I/O outside this library.
+- Cancellation requests completion; it does not release the request's buffers.
+- Drain completions before closing registrations, then close the port. Both
+  operations reject resources that are still busy.
+- Explicit cleanup is required. Abandoning a pending request retains its resources
+  rather than allowing Windows to access memory reclaimed by the GC.
 
-<!-- $MDX file=test/copy.ml -->
+## Example
+
 ```ocaml
-type req = [ `R | `W ]
-
-let () =
-  let iocp = Iocp.create () in
-  let fd = Iocp.Handle.openfile Sys.argv.(1) [O_RDONLY] 0 in
-  let out = Iocp.Handle.openfile Sys.argv.(2) [O_WRONLY; O_CREAT; O_TRUNC] 0o644 in
-  let buf = Cstruct.create 1024 in
-  let _job = Iocp.read iocp ~file_offset:Optint.Int63.zero fd buf ~off:0 ~len:1024 `R in
-  match Iocp.get_queued_completion_status iocp with
-    | None -> assert false
-    | Some t ->
-      assert (t.data = `R);
-      let _job = Iocp.write iocp ~file_offset:Optint.Int63.zero out buf ~off:0 ~len:t.bytes_transferred `W in
-      match Iocp.get_queued_completion_status iocp with
-      | None -> assert false
-      | Some t ->
-        assert (t.data = `W);
-        Unix.close (fd :> Unix.file_descr);
-        Unix.close (out :> Unix.file_descr)
+let read_file path =
+  let fd = Iocp.openfile path [Unix.O_RDONLY; O_CLOEXEC] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let port = Iocp.create () in
+  Fun.protect ~finally:(fun () -> Iocp.close port) @@ fun () ->
+  let handle = Iocp.register port fd in
+  Fun.protect ~finally:(fun () -> Iocp.close_handle handle) @@ fun () ->
+  let buf = Cstruct.create 4096 in
+  ignore (Iocp.read port ~id:1 handle buf ~offset:0L);
+  match Iocp.wait port ~timeout:(-1) with
+  | Some { error = None; bytes_transferred; _ } ->
+      Cstruct.to_string ~len:bytes_transferred buf
+  | Some { error = Some e; _ } -> raise (Unix.Unix_error (e, "read", path))
+  | None -> assert false
 ```
+
+`Iocp.pipe` creates private byte pipes with non-inheritable handles. Choose
+synchronous ends explicitly when handing them to programs that use synchronous
+standard I/O. Files normally use `Unix.openfile` followed by `ReOpenFile`. When creating a
+read-only file with write access, a single overlapped open sets the attribute
+at creation and preserves the creator's write access.
+Offsets are 64-bit, and append mode does not grant additional write access.
+
+## Build and test
+
+```
+opam install dune cstruct alcotest
+dune build @install
+dune runtest
+```
+
+The suite runs in native and self-contained bytecode modes, so both use the
+current stubs rather than an older installed DLL. It exercises completion delivery,
+cancellation and GC, failed submission
+rollback, large request counts, file offsets, Unicode paths and private pipes. Tests use temporary files and ephemeral
+ports. The earlier unreleased prototype API has been replaced; raw pointers,
+manual OVERLAPPED reuse, and the fixed-size request pool are no longer exposed.

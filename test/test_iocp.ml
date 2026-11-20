@@ -1,13 +1,6 @@
 (* Copyright (c) 2026 Anil Madhavapeddy <anil@recoil.org>
    SPDX-License-Identifier: MIT *)
 
-module Iocp = struct
-  include Iocp.Port
-
-  let openfile = Iocp.openfile
-  let pipe = Iocp.pipe
-end
-
 let registrations_lock = Mutex.create ()
 let registrations = ref []
 

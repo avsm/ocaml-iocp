@@ -9,9 +9,9 @@ license: "MIT"
 homepage: "https://github.com/ocaml-multicore/ocaml-iocp"
 bug-reports: "https://github.com/ocaml-multicore/ocaml-iocp/issues"
 depends: [
-  "dune" {>= "2.9"}
+  "dune" {>= "3.10"}
+  "ocaml" {>= "5.2"}
   "cstruct"
-  "optint"
   "alcotest" {with-test}
   "odoc" {with-doc}
 ]
@@ -24,12 +24,10 @@ build: [
     name
     "-j"
     jobs
-    "--promote-install-files=false"
     "@install"
     "@runtest" {with-test}
     "@doc" {with-doc}
   ]
-  ["dune" "install" "-p" name "--create-install-files" name]
 ]
 dev-repo: "git+https://github.com/ocaml-multicore/ocaml-iocp.git"
 available: os = "win32"
