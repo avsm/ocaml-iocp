@@ -549,3 +549,19 @@ CAMLprim value iocp_pipe(value read_async, value write_async) {
   Handle_val(wr) = w;
   CAMLreturn(result);
 }
+
+CAMLprim value iocp_wakeup_wait(value p, value timeout) {
+  CAMLparam2(p, timeout);
+  HANDLE h = port(p);
+  DWORD ms = (DWORD)Long_val(timeout);
+  DWORD bytes;
+  ULONG_PTR key;
+  OVERLAPPED *overlapped;
+  caml_enter_blocking_section();
+  BOOL ok = GetQueuedCompletionStatus(h, &bytes, &key, &overlapped, ms);
+  DWORD err = ok ? 0 : GetLastError();
+  caml_leave_blocking_section();
+  if (err && err != WAIT_TIMEOUT)
+    raise_win32(err, "GetQueuedCompletionStatus");
+  CAMLreturn(Val_unit);
+}

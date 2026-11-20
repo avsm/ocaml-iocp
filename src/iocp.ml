@@ -138,9 +138,12 @@ let cancel_all t =
 let notification =
   Some { id = 0; bytes_transferred = 0; error = None; source = None }
 
-let wait t ~timeout =
+let check_timeout timeout =
   if timeout < -1 || Int64.of_int timeout > 0xffff_fffeL then
-    invalid_arg "Iocp.wait: timeout";
+    invalid_arg "Iocp: invalid timeout"
+
+let wait t ~timeout =
+  check_timeout timeout;
   let claimed = ref false in
   let release () = t.waiting <- false in
   Fun.protect ~finally:(fun () -> if !claimed then locked t release)
@@ -298,6 +301,51 @@ let shutdown t h cmd =
               r.eof_on_cancel <- true;
               Raw.cancel_operation r.operation))
           t.requests)
+
+module Wakeup = struct
+  type t = { port : Raw.port; users : int Atomic.t }
+
+  (* One reference belongs to the owner. Closing sets the sign bit and drops
+     that reference after posting a notification for every possible waiter. *)
+  let create () = { port = Raw.create_port (); users = Atomic.make 1 }
+
+  let rec acquire t =
+    let n = Atomic.get t.users in
+    n > 0 && (Atomic.compare_and_set t.users n (n + 1) || acquire t)
+
+  let release t =
+    if Atomic.fetch_and_add t.users (-1) = min_int + 1 then
+      Raw.close_port t.port
+
+  let use t fn =
+    if acquire t then
+      match fn t.port with
+      | () -> release t
+      | exception ex ->
+          release t;
+          raise ex
+
+  let signal t = use t Raw.wake_port
+
+  let wait t timeout =
+    check_timeout timeout;
+    use t (fun port -> Raw.wait_notification port timeout)
+
+  let rec close t =
+    let n = Atomic.get t.users in
+    if n > 0 then
+      if Atomic.compare_and_set t.users n (min_int + n) then (
+        match
+          for _ = 2 to n do
+            Raw.wake_port t.port
+          done
+        with
+        | () -> release t
+        | exception ex ->
+            release t;
+            raise ex)
+      else close t
+end
 
 (*---------------------------------------------------------------------------
   Copyright (c) 2022 <patrick@sirref.org>

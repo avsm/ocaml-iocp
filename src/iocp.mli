@@ -202,3 +202,27 @@ val pipe :
     ends. The caller closes both with [Unix.close]. Both support overlapped I/O
     by default. Set an end's option to false for synchronous child standard I/O.
     Only asynchronous ends may use a port. *)
+
+module Wakeup : sig
+  (** Counted scheduler notifications for threads and domains. *)
+
+  type t
+  (** A notification port. *)
+
+  val create : unit -> t
+  (** Create an empty notification port. *)
+
+  val signal : t -> unit
+  (** Queue one notification without taking an OCaml lock. Signals accumulate
+      even when no thread is waiting. *)
+
+  val wait : t -> int -> unit
+  (** Consume one notification, or return on timeout or close. The timeout is in
+      milliseconds. Zero polls and [-1] waits indefinitely. Other values must
+      lie between zero and [0xffff_fffe]. *)
+
+  val close : t -> unit
+  (** Wake all waiters and release the port once outstanding calls return.
+      Repeated closes, signals and waits on a closed port have no effect.
+      Timeout validation also applies to a closed port. *)
+end
