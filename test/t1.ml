@@ -300,28 +300,6 @@ let safest () =
   assert (Cstruct.equal buf buf2)
 
 
-  let listening_sock iocp =
-    let addr = Unix.(ADDR_INET (Unix.inet_addr_loopback, 8889)) in
-    let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-    Unix.bind sock addr;
-    Unix.listen sock 0;
-    let sock_accept = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-    Unix.setsockopt sock SO_REUSEADDR true;
-    IM.handle_of_fd iocp sock 1, IM.handle_of_fd iocp sock_accept 2
-  
-  let listen () =
-    let iocp = IM.create 5 in
-    let sock, sock_accept = listening_sock iocp in
-    Format.eprintf "Got an accepting socket\n%!";
-    let addr_buf = Iocp.Accept_buffer.create () in
-    let id = IM.accept iocp sock sock_accept addr_buf in
-    id,iocp
-
-let gc_test () =
-  let _ = listen () in
-  Gc.full_major ();
-  ()
-
 let () =
   let open Alcotest in
   run "IOCP" [
@@ -332,7 +310,6 @@ let () =
           (* test_case "safest" `Quick safest; *)
           test_case "cancel" `Quick cancel;
           test_case "gc_before_more_tests" `Quick Gc.full_major;
-          test_case "gc" `Quick gc_test;
         ];
       "errors", [
         test_case "non_overlapped" `Quick error_non_overlapped;

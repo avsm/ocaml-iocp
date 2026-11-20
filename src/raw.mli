@@ -50,14 +50,4 @@ external write :
   t -> Handle.t -> Cstruct.buffer -> int -> int -> 'a Overlapped.t -> unit
   = "ocaml_iocp_write_bytes" "ocaml_iocp_write"
 
-external accept :
-  Handle.t -> Handle.t -> Cstruct.buffer -> 'a Overlapped.t -> unit
-  = "ocaml_iocp_accept"
-
-external connect :
-  t -> Handle.t -> Sockaddr.t -> 'a Overlapped.t -> unit
-  = "ocaml_iocp_connect"
-
-external send : t -> Handle.t -> Wsabuf.t -> 'a Overlapped.t -> unit = "ocaml_iocp_send"
-external recv : t -> Handle.t -> Wsabuf.t -> 'a Overlapped.t -> unit = "ocaml_iocp_recv"
 external cancel : Handle.t -> 'a Overlapped.t -> unit = "ocaml_iocp_cancel"

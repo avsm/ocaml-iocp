@@ -1,6 +1,6 @@
-(executables
- (names copy net safe_net)
- (modules copy net safe_net)
+(executable
+ (name copy)
+ (modules copy)
  (libraries iocp copy_lib))
 
 (library
