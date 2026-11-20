@@ -19,6 +19,7 @@ type completion = {
   id : int;
   bytes_transferred : int;
   error : Unix.error option;
+  source : Unix.sockaddr option;
 }
 
 external dequeue : port -> int -> int = "iocp_dequeue"
@@ -34,7 +35,13 @@ external allocate :
   port -> int -> Unix.file_descr -> 'a -> delivery -> operation
   = "iocp_allocate"
 
-type buffer_op = Read_file | Write_file | Recv | Send
+type buffer_op =
+  | Read_file
+  | Write_file
+  | Recv
+  | Send
+  | Recv_from
+  | Send_to of Unix.sockaddr
 
 external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> bool
   = "iocp_submit_buffer"

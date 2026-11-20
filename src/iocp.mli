@@ -57,7 +57,10 @@ type completion = {
   bytes_transferred : int;
       (** Counts the bytes transferred. A failed operation may report a partial
           transfer. *)
-  error : Unix.error option;  (** Is [None] on success or [Some e] on failure. *)
+  error : Unix.error option;
+      (** Is [None] on success or [Some e] on failure. *)
+  source : Unix.sockaddr option;
+      (** Gives the sender on successful datagram reception. *)
 }
 (** Describes a completed operation. *)
 
@@ -99,8 +102,8 @@ val close_handle : handle -> unit
     caller. *)
 
 val wake : t -> unit
-(** Queue a notification with [id = 0], zero bytes and no error. This function
-    may be called from another thread or domain. *)
+(** Queue a notification with [id = 0], zero bytes and no error or source
+    address. This function may be called from another thread or domain. *)
 
 val wait : t -> timeout:int -> completion option
 (** Consume the next queued completion, or return [None] on timeout. [timeout]
@@ -151,6 +154,14 @@ val recv : t -> id:int -> handle -> Cstruct.t -> request
 val send : t -> id:int -> handle -> Cstruct.t -> request
 (** Send stream data from the buffer. The completion reports the number of bytes
     sent, which may be less than the buffer length. *)
+
+val recvfrom : t -> id:int -> handle -> Cstruct.t -> request
+(** Receive a datagram into the buffer. The completion includes its source
+    address. A zero-length datagram preserves its source address. An oversized
+    datagram reports [EMSGSIZE] with the copied byte count and source address. *)
+
+val sendto : t -> id:int -> handle -> Cstruct.t -> Unix.sockaddr -> request
+(** Send the buffer as one datagram to the given address. *)
 
 val accept : t -> id:int -> handle -> client:Unix.file_descr -> request
 (** Accept a connection into [client], an unbound, unconnected socket of the

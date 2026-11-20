@@ -39,6 +39,11 @@
 CAMLextern value caml_win32_alloc_handle(HANDLE);
 CAMLextern void caml_win32_maperr(DWORD);
 CAMLextern value caml_unix_error_of_code(int);
+#ifdef caml_unix_alloc_sockaddr
+CAMLextern value(caml_unix_alloc_sockaddr)(struct sockaddr *, socklen_t, int);
+#else
+CAMLextern value caml_unix_alloc_sockaddr(union sock_addr_union *, socklen_param_type, int);
+#endif
 CAMLnoret CAMLextern void caml_uerror(const char *, value);
 #ifdef caml_unix_get_sockaddr
 CAMLextern void(caml_unix_get_sockaddr)(value, struct sockaddr_storage *, socklen_t *);
@@ -154,7 +159,7 @@ CAMLprim value iocp_wake(value v) {
 enum delivery { NATIVE_QUEUE, POST_QUEUE, IMMEDIATE };
 
 /* Constant constructors of Raw.buffer_op come first, in declaration order. */
-enum operation_kind { OP_READ, OP_WRITE, OP_RECV, OP_SEND, OP_ACCEPT, OP_CONNECT };
+enum operation_kind { OP_READ, OP_WRITE, OP_RECV, OP_SEND, OP_RECVFROM, OP_SENDTO, OP_ACCEPT, OP_CONNECT };
 
 typedef struct {
   OVERLAPPED overlapped; /* Must be first: completion packets return this address. */
@@ -167,6 +172,7 @@ typedef struct {
   DWORD bytes;
   enum delivery delivery;
   DWORD error;
+  int address_len;
   DWORD flags;
   union {
     char accept[2 * (sizeof(SOCKADDR_STORAGE) + 16)];
@@ -245,11 +251,16 @@ static void record_result(request *r, DWORD bytes, DWORD err) {
 
 static value completion(request *r, int eof_on_cancel) {
   CAMLparam0();
-  CAMLlocal3(result, error, code);
+  CAMLlocal4(result, error, code, source);
   DWORD err = r->error, bytes = r->bytes;
   if (eof_on_cancel && err == ERROR_OPERATION_ABORTED) {
     err = 0;
     bytes = 0;
+  }
+  source = Val_none;
+  if (r->kind == OP_RECVFROM && (!r->error || r->error == WSAEMSGSIZE)) {
+    source = caml_unix_alloc_sockaddr(&r->addresses.connect, r->address_len, -1);
+    source = caml_alloc_some(source);
   }
   error = Val_none;
   if (err) {
@@ -257,10 +268,11 @@ static value completion(request *r, int eof_on_cancel) {
     code = caml_unix_error_of_code(errno);
     error = caml_alloc_some(code);
   }
-  result = caml_alloc_tuple(3);
+  result = caml_alloc_tuple(4);
   Store_field(result, 0, Val_long(r->id));
   Store_field(result, 1, Val_long(bytes));
   Store_field(result, 2, error);
+  Store_field(result, 3, source);
   CAMLreturn(caml_alloc_some(result));
 }
 static value complete_immediately(request *r, DWORD bytes, DWORD err) {
@@ -304,7 +316,14 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
   uint64_t off = (uint64_t)Int64_val(offset);
   r->overlapped.Offset = (DWORD)off;
   r->overlapped.OffsetHigh = (DWORD)(off >> 32);
-  r->kind = Int_val(kind);
+  r->kind = Is_block(kind) ? OP_SENDTO : Int_val(kind);
+  if (r->kind == OP_RECVFROM)
+    r->address_len = sizeof(r->addresses.connect);
+  if (r->kind == OP_SENDTO) {
+    socklen_param_type len;
+    caml_unix_get_sockaddr(Field(kind, 0), &r->addresses.connect, &len);
+    r->address_len = len;
+  }
   DWORD err = 0;
   WSABUF b = {(ULONG)len, data};
   start(v);
@@ -323,6 +342,16 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
     break;
   case OP_SEND:
     if (WSASend((SOCKET)r->fd, &b, 1, NULL, 0, &r->overlapped, NULL) == SOCKET_ERROR)
+      err = WSAGetLastError();
+    break;
+  case OP_RECVFROM:
+    if (WSARecvFrom((SOCKET)r->fd, &b, 1, NULL, &r->flags, &r->addresses.connect.s_gen,
+                    &r->address_len, &r->overlapped, NULL) == SOCKET_ERROR)
+      err = WSAGetLastError();
+    break;
+  case OP_SENDTO:
+    if (WSASendTo((SOCKET)r->fd, &b, 1, NULL, 0, &r->addresses.connect.s_gen, r->address_len,
+                  &r->overlapped, NULL) == SOCKET_ERROR)
       err = WSAGetLastError();
     break;
   default:
