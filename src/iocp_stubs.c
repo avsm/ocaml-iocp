@@ -19,6 +19,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <mswsock.h>
 #include <winternl.h>
 #include <bcrypt.h>
 #include <stdint.h>
@@ -33,12 +34,18 @@
 #include <caml/signals.h>
 #include <caml/fail.h>
 #include <caml/unixsupport.h>
+#include <caml/socketaddr.h>
 
 CAMLextern value caml_win32_alloc_handle(HANDLE);
 CAMLextern void caml_win32_maperr(DWORD);
 CAMLextern void caml_unix_check_path(value, const char *);
 CAMLextern value caml_unix_error_of_code(int);
 CAMLnoret CAMLextern void caml_uerror(const char *, value);
+#ifdef caml_unix_get_sockaddr
+CAMLextern void(caml_unix_get_sockaddr)(value, struct sockaddr_storage *, socklen_t *);
+#else
+CAMLextern void caml_unix_get_sockaddr(value, union sock_addr_union *, socklen_param_type *);
+#endif
 
 static void raise_win32(DWORD err, const char *name) {
   caml_win32_maperr(err);
@@ -148,11 +155,12 @@ CAMLprim value iocp_wake(value v) {
 enum delivery { NATIVE_QUEUE, POST_QUEUE, IMMEDIATE };
 
 /* Constant constructors of Raw.buffer_op come first, in declaration order. */
-enum operation_kind { OP_READ, OP_WRITE };
+enum operation_kind { OP_READ, OP_WRITE, OP_RECV, OP_SEND, OP_ACCEPT, OP_CONNECT };
 
 typedef struct {
   OVERLAPPED overlapped; /* Must be first: completion packets return this address. */
   HANDLE fd;
+  SOCKET client;
   enum operation_kind kind;
   intnat id;
   value roots;
@@ -160,6 +168,11 @@ typedef struct {
   DWORD bytes;
   enum delivery delivery;
   DWORD error;
+  DWORD flags;
+  union {
+    char accept[2 * (sizeof(SOCKADDR_STORAGE) + 16)];
+    union sock_addr_union connect;
+  } addresses;
 } request;
 #define Request(v) (*(request **)Data_custom_val(Field(v, 0)))
 static void finalize_request(value v) {
@@ -208,18 +221,37 @@ static void finish(request *r) {
 }
 static void record_result(request *r, DWORD bytes, DWORD err) {
   if (!err) err = r->error;
-  if (r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) {
+  if (err && r->kind >= OP_RECV) {
+    DWORD flags = 0;
+    if (!WSAGetOverlappedResult((SOCKET)r->fd, &r->overlapped, &bytes, FALSE, &flags))
+      err = WSAGetLastError();
+  }
+  if ((r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) ||
+      (r->kind == OP_RECV && err == WSAESHUTDOWN)) {
     err = 0;
     bytes = 0;
   }
+  if (!err && r->kind == OP_ACCEPT) {
+    SOCKET listener = (SOCKET)r->fd;
+    if (setsockopt(r->client, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char *)&listener,
+                   sizeof(listener)) == SOCKET_ERROR)
+      err = WSAGetLastError();
+  }
+  if (!err && r->kind == OP_CONNECT &&
+      setsockopt((SOCKET)r->fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0) == SOCKET_ERROR)
+    err = WSAGetLastError();
   r->bytes = bytes;
   r->error = err;
 }
 
-static value completion(request *r) {
+static value completion(request *r, int eof_on_cancel) {
   CAMLparam0();
   CAMLlocal3(result, error, code);
   DWORD err = r->error, bytes = r->bytes;
+  if (eof_on_cancel && err == ERROR_OPERATION_ABORTED) {
+    err = 0;
+    bytes = 0;
+  }
   error = Val_none;
   if (err) {
     caml_win32_maperr(err);
@@ -244,8 +276,11 @@ static value submitted(request *r, DWORD err, const char *op) {
     raise_win32(err, op);
   }
   if (!err && r->delivery != NATIVE_QUEUE) {
-    DWORD bytes = 0;
-    if (!GetOverlappedResult(r->fd, &r->overlapped, &bytes, FALSE))
+    DWORD bytes = 0, flags = 0;
+    if (r->kind >= OP_RECV) {
+      if (!WSAGetOverlappedResult((SOCKET)r->fd, &r->overlapped, &bytes, FALSE, &flags))
+        err = WSAGetLastError();
+    } else if (!GetOverlappedResult(r->fd, &r->overlapped, &bytes, FALSE))
       err = GetLastError();
     if (r->delivery == IMMEDIATE)
       return complete_immediately(r, bytes, err);
@@ -272,6 +307,7 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
   r->overlapped.OffsetHigh = (DWORD)(off >> 32);
   r->kind = Int_val(kind);
   DWORD err = 0;
+  WSABUF b = {(ULONG)len, data};
   start(v);
   switch (r->kind) {
   case OP_READ:
@@ -282,8 +318,20 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
     if (!WriteFile(r->fd, data, (DWORD)len, NULL, &r->overlapped))
       err = GetLastError();
     break;
+  case OP_RECV:
+    if (WSARecv((SOCKET)r->fd, &b, 1, NULL, &r->flags, &r->overlapped, NULL) == SOCKET_ERROR)
+      err = WSAGetLastError();
+    break;
+  case OP_SEND:
+    if (WSASend((SOCKET)r->fd, &b, 1, NULL, 0, &r->overlapped, NULL) == SOCKET_ERROR)
+      err = WSAGetLastError();
+    break;
+  default:
+    finish(r);
+    caml_invalid_argument("Iocp: invalid buffer operation");
   }
-  if (r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) {
+  if ((r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) ||
+      (r->kind == OP_RECV && err == WSAESHUTDOWN)) {
     if (r->delivery == IMMEDIATE)
       CAMLreturn(complete_immediately(r, 0, 0));
     if (PostQueuedCompletionStatus(port(Field(v, 1)), 0, 0, &r->overlapped))
@@ -293,11 +341,43 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
   }
   CAMLreturn(submitted(r, err, "overlapped_io"));
 }
-CAMLprim value iocp_completion(value v) {
-  CAMLparam1(v);
+CAMLprim value iocp_submit_accept(value v, value client) {
+  CAMLparam2(v, client);
+  request *r = Request(v);
+  GUID guid = WSAID_ACCEPTEX;
+  LPFN_ACCEPTEX fn;
+  DWORD bytes;
+  if (WSAIoctl((SOCKET)r->fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &fn,
+               sizeof(fn), &bytes, NULL, NULL) == SOCKET_ERROR)
+    raise_win32(WSAGetLastError(), "AcceptEx lookup");
+  r->kind = OP_ACCEPT;
+  r->client = Socket_val(client);
+  start(v);
+  BOOL ok = fn((SOCKET)r->fd, r->client, r->addresses.accept, 0, sizeof(SOCKADDR_STORAGE) + 16,
+               sizeof(SOCKADDR_STORAGE) + 16, &bytes, &r->overlapped);
+  CAMLreturn(submitted(r, ok ? 0 : WSAGetLastError(), "AcceptEx"));
+}
+CAMLprim value iocp_submit_connect(value v, value addr) {
+  CAMLparam2(v, addr);
+  request *r = Request(v);
+  GUID guid = WSAID_CONNECTEX;
+  LPFN_CONNECTEX fn;
+  DWORD bytes;
+  socklen_param_type len;
+  caml_unix_get_sockaddr(addr, &r->addresses.connect, &len);
+  if (WSAIoctl((SOCKET)r->fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &fn,
+               sizeof(fn), &bytes, NULL, NULL) == SOCKET_ERROR)
+    raise_win32(WSAGetLastError(), "ConnectEx lookup");
+  r->kind = OP_CONNECT;
+  start(v);
+  BOOL ok = fn((SOCKET)r->fd, &r->addresses.connect.s_gen, len, NULL, 0, &bytes, &r->overlapped);
+  CAMLreturn(submitted(r, ok ? 0 : WSAGetLastError(), "ConnectEx"));
+}
+CAMLprim value iocp_completion(value v, value eof_on_cancel) {
+  CAMLparam2(v, eof_on_cancel);
   CAMLlocal1(result);
   request *r = Request(v);
-  result = completion(r);
+  result = completion(r, Bool_val(eof_on_cancel));
   if (r->pending)
     finish(r);
   CAMLreturn(result);

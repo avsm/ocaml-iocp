@@ -3,9 +3,9 @@
 
 (** Windows I/O completion ports.
 
-    A port delivers completions for operations on registered files and pipes.
-    Threads and domains may submit and cancel requests concurrently. Each port
-    admits one caller of {!wait} at a time.
+    A port delivers completions for operations on registered files, pipes and
+    sockets. Threads and domains may submit and cancel requests concurrently.
+    Each port admits one caller of {!wait} at a time.
 
     {1:delivery Completion delivery}
 
@@ -132,7 +132,8 @@ val cancel_all : t -> unit
     port, a non-positive ID or an outstanding duplicate ID raises
     [Invalid_argument]. A Windows error during submission may raise
     [Unix.Unix_error] directly. In that case there is no completion to drain.
-    For a returned request, inspect the [error] field on delivery. *)
+    For a returned request, inspect the [error] field on delivery. Winsock may
+    cancel pending socket I/O when the submitting OS thread exits. *)
 
 val read : t -> id:int -> handle -> Cstruct.t -> offset:int64 -> request
 (** Read into the buffer at the given file offset. Use a non-negative offset for
@@ -142,6 +143,33 @@ val read : t -> id:int -> handle -> Cstruct.t -> offset:int64 -> request
 val write : t -> id:int -> handle -> Cstruct.t -> offset:int64 -> request
 (** Write from the buffer at the given file offset. Use a non-negative offset
     for files, [-1L] for atomic append, and [0L] for pipes. *)
+
+val recv : t -> id:int -> handle -> Cstruct.t -> request
+(** Receive stream data into the buffer. End of input completes successfully
+    with zero bytes. *)
+
+val send : t -> id:int -> handle -> Cstruct.t -> request
+(** Send stream data from the buffer. The completion reports the number of bytes
+    sent, which may be less than the buffer length. *)
+
+val accept : t -> id:int -> handle -> client:Unix.file_descr -> request
+(** Accept a connection into [client], an unbound, unconnected socket of the
+    listener's family and type. The caller supplies and owns [client]. Reserve
+    it exclusively for this accept until completion. On success,
+    [Unix.getpeername client] returns the peer and {!register} can register
+    [client] for further I/O. *)
+
+val connect : t -> id:int -> handle -> Unix.sockaddr -> request
+(** Connect a bound socket to the given address. Successful completion updates
+    its connection context. *)
+
+val shutdown : t -> handle -> Unix.shutdown_command -> unit
+(** Shut down a socket. Receive shutdown also cancels outstanding receives on
+    this port, including receives through duplicated descriptors. An aborted
+    receive then completes successfully with zero bytes and no source address. A
+    receive that already completed keeps its data or error. If a duplicated
+    socket lacks its connection context, shutdown tries its other live
+    registrations for the same kernel object. *)
 
 (** {1 Descriptor constructors} *)
 
