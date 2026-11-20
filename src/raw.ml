@@ -72,3 +72,5 @@ external create_readonly :
 
 external pipe_raw : bool -> bool -> message:bool -> Unix.file_descr * Unix.file_descr
   = "iocp_pipe"
+
+external wait_notification : port -> int -> unit = "iocp_wakeup_wait"

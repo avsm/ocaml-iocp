@@ -485,6 +485,32 @@ let pipe_eof () =
     assert (Iocp.wait p ~timeout:0 = None)
   done
 
+let notification () =
+  let module W = Iocp.Wakeup in
+  let t = W.create () in
+  Fun.protect ~finally:(fun () -> W.close t) @@ fun () ->
+  W.wait t 0;
+  invalid (fun () -> W.wait t (-2));
+  W.signal t;
+  W.signal t;
+  W.wait t (-1);
+  W.wait t (-1);
+  let started = Atomic.make 0 in
+  let waiter () =
+    Atomic.incr started;
+    W.wait t (-1)
+  in
+  let a = Domain.spawn waiter and b = Domain.spawn waiter in
+  while Atomic.get started < 2 do
+    Domain.cpu_relax ()
+  done;
+  W.close t;
+  Domain.join a;
+  Domain.join b;
+  W.signal t;
+  W.wait t (-1);
+  invalid (fun () -> W.wait t (-2))
+
 let immediate () =
   let p = Iocp.create ~skip_on_success:true () in
   let r, w = Iocp.pipe () in
@@ -802,6 +828,7 @@ let () =
             ("registration reuse across modes", registration_reuse);
             ("foreign alias after handle reuse", foreign_alias_reuse);
             ("immediate completion without duplicates", immediate);
+            ("scheduler notification", notification);
             ("datagrams and cancellation", datagrams);
             ("cancel blocked pipe write", cancel_write);
             ("pipe EOF", pipe_eof);
