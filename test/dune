@@ -24,3 +24,8 @@
  (alias runtest)
  (action
   (run ./t1.exe)))
+
+(test
+ (name test_iocp)
+ (modules test_iocp)
+ (libraries iocp alcotest))

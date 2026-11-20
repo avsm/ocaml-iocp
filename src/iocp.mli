@@ -1,3 +1,6 @@
+(* Copyright (c) 2026 Anil Madhavapeddy <anil@recoil.org>
+   SPDX-License-Identifier: MIT *)
+
 (** {2 Input/Output Completion Ports} 
     
     Bindings to input/output completion ports (IOCP) allowing for efficient,
@@ -5,7 +8,7 @@
 
 module Overlapped = Overlapped
 module Handle = Handle
-module Raw = Raw
+module Raw = Prototype_raw
 
 type t
 type fd = Handle.t
@@ -26,7 +29,14 @@ val create : int -> t
 
 val handle_of_fd : t -> Unix.file_descr -> int -> fd
 
-val openfile: t -> int -> string -> Unix.open_flag list -> int -> fd
+val openfile :
+  string -> Unix.open_flag list -> Unix.file_perm -> Unix.file_descr
+(** Open a file for overlapped I/O and return a caller-owned descriptor. Accept
+    access, append, creation, truncation, exclusive creation and inheritance
+    flags. Raise [Invalid_argument] for unsupported flags. Inheritance requires
+    [O_KEEPEXEC] without [O_CLOEXEC]. Creation applies the requested Windows
+    read-only attribute when opening the file. Append restricts writable handles
+    to appending. Read-only handles keep their original access. *)
 
 val read : t -> fd -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t
 

@@ -2,6 +2,7 @@
  (name iocp)
  (public_name iocp)
  (enabled_if (= %{os_type} "Win32"))
+ (private_modules raw)
  (libraries unix cstruct optint threads)
  (foreign_stubs
   (language c)

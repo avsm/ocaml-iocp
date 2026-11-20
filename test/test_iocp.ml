@@ -1,0 +1,61 @@
+(* Copyright (c) 2026 Anil Madhavapeddy <anil@recoil.org>
+   SPDX-License-Identifier: MIT *)
+
+let check = Alcotest.(check int)
+let close_fd = Unix.close
+
+let creation_permissions () =
+  let run mode (exists, was_readonly, flags) =
+    let reference = Filename.temp_file "unix-perm" ".tmp" in
+    let path = Filename.temp_file "iocp-perm" ".tmp" in
+    Fun.protect ~finally:(fun () ->
+        List.iter
+          (fun p ->
+            if Sys.file_exists p then (
+              Unix.chmod p 0o600;
+              Sys.remove p))
+          [ reference; path ])
+    @@ fun () ->
+    List.iter
+      (fun p ->
+        if not exists then Sys.remove p
+        else Unix.chmod p (if was_readonly then 0o400 else 0o600))
+      [ reference; path ];
+    let flags = mode :: Unix.O_CLOEXEC :: flags in
+    let open_result fn path =
+      try Ok (fn path flags 0o400) with Unix.Unix_error (e, _, _) -> Error e
+    in
+    match open_result Unix.openfile reference with
+    | Error expected -> (
+        match open_result Iocp.openfile path with
+        | Error actual -> assert (expected = actual)
+        | Ok fd ->
+            close_fd fd;
+            Alcotest.fail "Iocp.openfile succeeded where Unix.openfile failed")
+    | Ok reference_fd ->
+        Fun.protect ~finally:(fun () -> close_fd reference_fd) @@ fun () ->
+        let fd = Iocp.openfile path flags 0o400 in
+        Fun.protect ~finally:(fun () -> close_fd fd) @@ fun () ->
+        check "permissions follow Unix.openfile"
+          (Unix.fstat reference_fd).st_perm (Unix.fstat fd).st_perm
+  in
+  List.iter
+    (fun mode ->
+      List.iter (run mode)
+        [
+          (false, false, [ Unix.O_CREAT; O_EXCL ]);
+          (false, false, [ O_CREAT ]);
+          (false, false, [ O_CREAT; O_TRUNC ]);
+          (false, false, [ O_CREAT; O_APPEND ]);
+          (false, false, [ O_CREAT; O_APPEND; O_TRUNC ]);
+          (true, false, [ O_CREAT ]);
+          (true, false, [ O_CREAT; O_TRUNC ]);
+          (true, false, [ O_CREAT; O_EXCL ]);
+          (true, false, [ O_CREAT; O_APPEND ]);
+          (true, false, [ O_CREAT; O_APPEND; O_TRUNC ]);
+          (true, true, [ O_CREAT ]);
+          (true, true, [ O_CREAT; O_TRUNC ]);
+        ])
+    [ Unix.O_RDONLY; O_WRONLY; O_RDWR ]
+
+let () = Alcotest.run "iocp" [ "files", [ Alcotest.test_case "creation permissions" `Quick creation_permissions ] ]

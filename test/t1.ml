@@ -55,7 +55,7 @@ let write_read () =
   let iocp = Iocp.Raw.create_io_completion_port 10 in
   let filename = "test_file_1.txt" in
   let handle =
-    Iocp.Raw.openfile iocp 1 filename Unix.[ O_CREAT; O_RDWR; O_TRUNC ] 0o600
+    Iocp.Raw.associate_fd_with_iocp iocp (Iocp.openfile filename Unix.[ O_CREAT; O_RDWR; O_TRUNC ] 0o600) 1
   in
   let ol = Iocp.Overlapped.create ~off:Optint.Int63.zero () in
   let buf = Cstruct.of_string "Test data" in
@@ -261,7 +261,7 @@ let error_out_of_bounds () =
   let _n = Unix.write oc (Bytes.of_string "Test file\n") 0 10 in
   Unix.close oc;
   let iocp = Iocp.Raw.create_io_completion_port 10 in
-  let handle = Iocp.Raw.openfile iocp 1 filename Unix.[ O_RDONLY ] 0 in
+  let handle = Iocp.Raw.associate_fd_with_iocp iocp (Iocp.openfile filename Unix.[ O_RDONLY ] 0) 1 in
   let buf = Cstruct.create 1 in
   let ol = Iocp.Overlapped.create ~off:(Optint.Int63.of_int 1024) () in
   match Iocp.Raw.read iocp handle (Cstruct.to_bigarray buf) 1 0 ol with
@@ -275,7 +275,7 @@ let safest () =
   let iocp = Iocp.create 10 in
   let filename = "test_file_3.txt" in
   let handle =
-    Iocp.openfile iocp 1 filename Unix.[ O_CREAT; O_RDWR; O_TRUNC ] 0o600
+    Iocp.handle_of_fd iocp (Iocp.openfile filename Unix.[ O_CREAT; O_RDWR; O_TRUNC ] 0o600) 1
   in
   let buf = Cstruct.of_string "Test data" in
   let write_id =

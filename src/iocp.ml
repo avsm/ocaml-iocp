@@ -1,11 +1,13 @@
 (*----------------------------------------------------------------------
    Copyright (c) 2022 Patrick Ferris <patrick@sirref.org>
+   Copyright (c) 2026 Anil Madhavapeddy <anil@recoil.org>
    Distributed under the MIT license. See terms at the end of this file.
   ----------------------------------------------------------------------*)
 
 module Handle = Handle
 module Overlapped = Overlapped
-module Raw = Raw
+module Native = Raw
+module Raw = Prototype_raw
 
 module Id = struct
   type t = int
@@ -73,7 +75,46 @@ let get_overlapped v fd root =
     (* Format.eprintf "Found an overlapped: id=%d external_key=%d internal_key=%d\n%!" id external_key key; *)
     ol, external_key
 
-let openfile t = Raw.openfile t.iocp
+let openfile path flags perm =
+  let has f = List.mem f flags in
+  List.iter
+    (function
+      | Unix.O_RDONLY | O_WRONLY | O_RDWR | O_APPEND | O_CREAT | O_TRUNC
+      | O_EXCL | O_CLOEXEC | O_KEEPEXEC ->
+          ()
+      | _ -> invalid_arg "Iocp.openfile: unsupported flag")
+    flags;
+  let mode, access =
+    if has Unix.O_RDWR then (Unix.O_RDWR, Native.Read_write)
+    else if has O_WRONLY then (Unix.O_WRONLY, Native.Write)
+    else (Unix.O_RDONLY, Native.Read)
+  in
+  let open_flags =
+    List.filter
+      (function
+        | Unix.O_RDONLY | O_WRONLY | O_RDWR | O_APPEND | O_CLOEXEC | O_KEEPEXEC
+          ->
+            false
+        | _ -> true)
+      flags
+  in
+  let open_flags = Unix.O_CLOEXEC :: mode :: open_flags in
+  let fd =
+    if access <> Native.Read && has O_CREAT && perm land 0o200 = 0 then
+      Native.create_readonly path access (has O_APPEND) ~exclusive:(has O_EXCL)
+        ~truncate:(has O_TRUNC)
+    else
+      let original = Unix.openfile path open_flags perm in
+      Fun.protect
+        ~finally:(fun () -> Unix.close original)
+        (fun () -> Native.reopen original access (has O_APPEND))
+  in
+  try
+    if has O_KEEPEXEC && not (has O_CLOEXEC) then Unix.clear_close_on_exec fd;
+    fd
+  with ex ->
+    Unix.close fd;
+    raise ex
 
 let read : t -> Handle.t -> Cstruct.buffer -> pos:int -> len:int -> off:Optint.Int63.t -> Id.t =
   fun v fd buf ~pos ~len ~off ->
