@@ -35,6 +35,7 @@ type 'a t = {
 and 'a association = {
   key : file_key;
   port_state : 'a t;
+  receives : (int, 'a request) Hashtbl.t;
   mutable skip : bool option;
   mutable handles : 'a handle list;
 }
@@ -94,7 +95,7 @@ let same_handle = Raw.same_handle
 let register t fd =
   locked t (fun () ->
       check t;
-      let a = { key = object end; port_state = t; skip = None; handles = [] } in
+      let a = { key = object end; port_state = t; receives = Hashtbl.create 0; skip = None; handles = [] } in
       let h = { association = a; fd; pending = 0; released = false } in
       a.handles <- [h];
       let files = Files.add a.key a t.files in
@@ -148,6 +149,11 @@ let check_timeout timeout =
   if timeout < -1 || Int64.of_int timeout > 0xffff_fffeL then
     invalid_arg "Iocp: invalid timeout"
 
+let remove_request t r =
+  Hashtbl.remove t.requests r.id;
+  if r.receive then Hashtbl.remove r.handle.association.receives r.id;
+  r.handle.pending <- r.handle.pending - 1
+
 let wait t ~timeout =
   check_timeout timeout;
   let claimed = ref None in
@@ -181,8 +187,7 @@ let wait t ~timeout =
       locked t (fun () ->
           let r = Hashtbl.find t.requests id in
           let result = Some (Completion (r.data, Raw.completion r.operation r.eof_on_cancel)) in
-          Hashtbl.remove t.requests id;
-          r.handle.pending <- r.handle.pending - 1;
+          remove_request t r;
           Raw.acknowledge slot;
           result)
 
@@ -222,18 +227,16 @@ let submit ?(receive = false) t ~data h roots fn =
       in
       h.pending <- h.pending + 1;
       match
+        if receive then Hashtbl.add h.association.receives id r;
         Hashtbl.add t.requests id r;
         fn operation
       with
       | immediate ->
           r.immediate <- immediate;
-          if immediate then (
-            h.pending <- h.pending - 1;
-            Hashtbl.remove t.requests id);
+          if immediate then remove_request t r;
           r
       | exception ex ->
-          h.pending <- h.pending - 1;
-          Hashtbl.remove t.requests id;
+          remove_request t r;
           raise ex)
 
 let result r = if r.immediate then Some (Raw.completion r.operation false) else None
@@ -320,10 +323,9 @@ let shutdown t h cmd =
       if cmd <> Unix.SHUTDOWN_SEND then
         Hashtbl.iter
           (fun _ r ->
-            if r.receive && r.handle.association == h.association then (
-              r.eof_on_cancel <- true;
-              Raw.cancel_operation r.operation))
-          t.requests)
+            r.eof_on_cancel <- true;
+            Raw.cancel_operation r.operation)
+          h.association.receives)
 
 module Shared = struct
   type 'a t = { raw : 'a; users : int Atomic.t; dispose : 'a -> unit }
