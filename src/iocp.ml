@@ -13,17 +13,25 @@ type completion = Raw.completion = {
 
 type waiter = { slot : Raw.slot; mutable busy : bool }
 
+type file_key = < >
+
+module Files = Map.Make (struct
+  type t = file_key
+  let compare = Stdlib.compare
+end)
+
 type t = {
   port : Raw.port;
   skip_on_success : bool;
   lock : Mutex.t;
   requests : (int, request) Hashtbl.t;
-  mutable registered : int;
+  mutable files : association Files.t;
   mutable closed : bool;
   mutable waiters : waiter list;
 }
 
 and association = {
+  key : file_key;
   port_state : t;
   mutable skip : bool option;
   mutable handles : handle list;
@@ -46,8 +54,6 @@ and request = {
   mutable immediate : bool;
 }
 
-let association_lock = Mutex.create ()
-let associations : association list ref = ref []
 let locked t fn = Mutex.protect t.lock fn
 let check t = if t.closed then invalid_arg "Iocp: closed port"
 
@@ -55,7 +61,7 @@ let create ?(skip_on_success = false) () =
   {
     skip_on_success;
     port = Raw.create_port ();
-    registered = 0;
+    files = Files.empty;
     lock = Mutex.create ();
     requests = Hashtbl.create 16;
     closed = false;
@@ -67,7 +73,7 @@ let pending t = locked t (fun () -> Hashtbl.length t.requests)
 let close t =
   locked t (fun () ->
       if not t.closed then (
-        if List.exists (fun w -> w.busy) t.waiters || t.registered <> 0 || Hashtbl.length t.requests <> 0
+        if List.exists (fun w -> w.busy) t.waiters || not (Files.is_empty t.files) || Hashtbl.length t.requests <> 0
         then invalid_arg "Iocp.close: port is busy";
         Raw.close_port t.port;
         t.closed <- true))
@@ -77,47 +83,42 @@ let check_handle t h =
   if h.released then invalid_arg "Iocp: closed handle";
   if h.association.port_state != t then invalid_arg "Iocp: wrong port"
 
+let file_key h = h.association.key
+
 let register t fd =
   locked t (fun () ->
       check t;
-      Mutex.protect association_lock (fun () ->
-          let found =
-            List.find_opt
-              (fun a -> Raw.same_handle fd (List.hd a.handles).fd)
-              !associations
-          in
-          let a =
-            match found with
-            | Some a when a.port_state == t -> a
-            | Some _ -> raise (Unix.Unix_error (EINVAL, "Iocp.register", ""))
-            | None -> { port_state = t; skip = None; handles = [] }
-          in
-          let h = { association = a; fd; pending = 0; released = false } in
-          let handles = h :: a.handles in
-          (match found with
-          | Some _ -> ()
-          | None ->
-              let all = a :: !associations in
-              Raw.associate_port t.port fd;
-              associations := all);
-          a.handles <- handles;
-          t.registered <- t.registered + 1;
-          h))
+      let a = { key = object end; port_state = t; skip = None; handles = [] } in
+      let h = { association = a; fd; pending = 0; released = false } in
+      a.handles <- [h];
+      let files = Files.add a.key a t.files in
+      match Raw.associate_port t.port fd with
+      | () ->
+          t.files <- files;
+          h
+      | exception (Unix.Unix_error (EINVAL, _, _) as ex) ->
+          (* Windows rejects a second association, including through a duplicate. *)
+          match Files.to_seq t.files |> Seq.find_map (fun (_, a) ->
+              if Raw.same_handle fd (List.hd a.handles).fd then Some a else None) with
+          | None -> raise ex
+          | Some a ->
+              let h = { h with association = a } in
+              a.handles <- h :: a.handles;
+              h)
 
 let close_handle h =
   let a = h.association in
-  locked a.port_state (fun () ->
+  let t = a.port_state in
+  locked t (fun () ->
       if not h.released then (
         if h.pending <> 0 then invalid_arg "Iocp.close_handle: handle is busy";
-        Mutex.protect association_lock (fun () ->
-            let remaining = List.filter (fun other -> other != h) a.handles in
-            if remaining = [] then (
-              let all = List.filter (fun other -> other != a) !associations in
-              Raw.detach h.fd;
-              associations := all);
-            a.handles <- remaining;
-            h.released <- true;
-            a.port_state.registered <- a.port_state.registered - 1)))
+        let remaining = List.filter (fun other -> other != h) a.handles in
+        if remaining = [] then (
+          let files = Files.remove a.key t.files in
+          Raw.detach h.fd;
+          t.files <- files);
+        a.handles <- remaining;
+        h.released <- true))
 
 let wake t =
   locked t (fun () ->

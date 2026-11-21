@@ -760,6 +760,8 @@ let registered_aliases ~skip_on_success () =
   with_registration p r @@ fun original ->
   with_registration p alias @@ fun duplicate ->
   with_registration p w @@ fun writer ->
+  assert (Iocp.file_key original == Iocp.file_key duplicate);
+  assert (Iocp.file_key original != Iocp.file_key writer);
   let buf = Cstruct.create 1 in
   let read = Iocp.read p ~id:1 duplicate buf ~offset:0L in
   invalid (fun () -> Iocp.close_handle duplicate);

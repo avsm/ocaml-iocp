@@ -95,6 +95,13 @@ val register : t -> Unix.file_descr -> handle
     for a port using queued delivery. Windows retains this mode after detach. A
     subsequent native consumer must handle synchronous success itself. *)
 
+type file_key
+(** Identifies an association by physical equality across live aliases. *)
+
+val file_key : handle -> file_key
+(** Return the shared key for this registration. Registering the file again
+    after the last registration closes creates a fresh key. *)
+
 val close_handle : handle -> unit
 (** Close a registration. Repeated calls have no effect. Raise
     [Invalid_argument] while its requests remain pending. Closing the last
