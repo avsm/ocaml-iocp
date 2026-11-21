@@ -317,49 +317,63 @@ let shutdown t h cmd =
               Raw.cancel_operation r.operation))
           t.requests)
 
-module Wakeup = struct
-  type t = { port : Raw.port; users : int Atomic.t }
+module Shared = struct
+  type 'a t = { raw : 'a; users : int Atomic.t; dispose : 'a -> unit }
 
   (* One reference belongs to the owner. Closing sets the sign bit and drops
      that reference after posting a notification for every possible waiter. *)
-  let create () = { port = Raw.create_port (); users = Atomic.make 1 }
+  let create raw dispose = { raw; users = Atomic.make 1; dispose }
 
   let rec acquire t =
     let n = Atomic.get t.users in
     n > 0 && (Atomic.compare_and_set t.users n (n + 1) || acquire t)
 
   let release t =
-    if Atomic.fetch_and_add t.users (-1) = min_int + 1 then
-      Raw.close_port t.port
+    if Atomic.fetch_and_add t.users (-1) = min_int + 1 then t.dispose t.raw
 
   let use t fn =
     if acquire t then
-      match fn t.port with
+      match fn t.raw with
       | () -> release t
       | exception ex ->
           release t;
           raise ex
 
-  let signal t = use t Raw.wake_port
-
-  let wait t timeout =
-    check_timeout timeout;
-    use t (fun port -> Raw.wait_notification port timeout)
-
-  let rec close t =
+  let rec close t notify =
     let n = Atomic.get t.users in
     if n > 0 then
       if Atomic.compare_and_set t.users n (min_int + n) then (
-        match
-          for _ = 2 to n do
-            Raw.wake_port t.port
-          done
-        with
+        match notify t.raw (n - 1) with
         | () -> release t
         | exception ex ->
             release t;
             raise ex)
-      else close t
+      else close t notify
+end
+
+module Wakeup = struct
+  type t = Raw.port Shared.t
+
+  let create () = Shared.create (Raw.create_port ()) Raw.close_port
+  let signal t = Shared.use t Raw.wake_port
+
+  let wait t timeout =
+    check_timeout timeout;
+    Shared.use t (fun p -> Raw.wait_notification p timeout)
+
+  let close t =
+    Shared.close t (fun p n ->
+        for _ = 1 to n do
+          Raw.wake_port p
+        done)
+end
+
+module Interrupt = struct
+  type t = Unix.file_descr Shared.t
+
+  let current () = Shared.create (Raw.current_thread ()) Unix.close
+  let signal t = Shared.use t Raw.interrupt
+  let close t = Shared.close t (fun _ _ -> ())
 end
 
 (*---------------------------------------------------------------------------

@@ -107,7 +107,8 @@ val wake : t -> unit
     address. This function may be called from another thread or domain. *)
 
 val wait : t -> timeout:int -> completion option
-(** Consume the next queued completion, or return [None] on timeout. [timeout] is in milliseconds. Zero polls and [-1] waits
+(** Consume the next queued completion, or return [None] on timeout or
+    interruption. [timeout] is in milliseconds. Zero polls and [-1] waits
     indefinitely. Raise [Invalid_argument] for other negative values. Finite
     timeouts must not exceed [0xffff_fffe]. If constructing a completion raises
     [Out_of_memory], another call to [wait] can collect the packet. *)
@@ -224,4 +225,18 @@ module Wakeup : sig
   (** Wake all waiters and release the port once outstanding calls return.
       Repeated closes, signals and waits on a closed port have no effect.
       Timeout validation also applies to a closed port. *)
+end
+
+module Interrupt : sig
+  type t
+
+  val current : unit -> t
+  (** Capture the calling OS thread as a wakeup target. *)
+
+  val signal : t -> unit
+  (** Interrupt an alertable wait on the captured thread. A signal sent before
+      an IOCP wait also wakes the next call to {!wait} on that thread. *)
+
+  val close : t -> unit
+  (** Release the target. Later signals have no effect. *)
 end

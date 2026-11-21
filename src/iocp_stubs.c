@@ -75,9 +75,24 @@ static HANDLE port(value v) {
     caml_invalid_argument("Iocp: closed port");
   return Port(v);
 }
+/* An unrelated alertable wait can deliver the APC before dequeue starts. */
+static INIT_ONCE interrupt_once = INIT_ONCE_STATIC_INIT;
+static DWORD interrupt_tls;
+static BOOL CALLBACK init_interrupt_tls(INIT_ONCE *once, void *param, void **context) {
+  (void)once; (void)param; (void)context;
+  interrupt_tls = TlsAlloc();
+  return interrupt_tls != TLS_OUT_OF_INDEXES;
+}
+
+static void ensure_interrupt_tls(void) {
+  if (!InitOnceExecuteOnce(&interrupt_once, init_interrupt_tls, NULL, NULL))
+    raise_win32(ERROR_NOT_ENOUGH_MEMORY, "TlsAlloc");
+}
+
 CAMLprim value iocp_create(value unit) {
   CAMLparam1(unit);
   CAMLlocal1(v);
+  ensure_interrupt_tls();
   v = caml_alloc_custom(&port_ops, sizeof(HANDLE), 0, 1);
   Port(v) = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, MAXDWORD);
   if (Port(v) == NULL)
@@ -414,24 +429,54 @@ CAMLprim value iocp_dequeue(value p, value slot, value timeout) {
   HANDLE h = port(p);
   intnat *id = Caml_ba_data_val(slot);
   if (*id < 0) {
-    DWORD bytes, ms = (DWORD)Long_val(timeout);
-    ULONG_PTR key;
-    OVERLAPPED *ol = NULL;
+    OVERLAPPED_ENTRY entry;
+    ULONG count;
+    DWORD ms = Long_val(timeout);
     caml_enter_blocking_section();
-    BOOL ok = GetQueuedCompletionStatus(h, &bytes, &key, &ol, ms);
-    DWORD err = ok ? 0 : GetLastError();
-    if (ol) {
-      request *r = (request *)ol;
-      record_result(r, bytes, err);
+    BOOL ok = FALSE;
+    DWORD err = WAIT_IO_COMPLETION;
+    if (!TlsGetValue(interrupt_tls)) {
+      ok = GetQueuedCompletionStatusEx(h, &entry, 1, &count, ms, TRUE);
+      err = ok ? 0 : GetLastError();
+    }
+    TlsSetValue(interrupt_tls, NULL);
+    if (ok && entry.lpOverlapped) {
+      request *r = (request *)entry.lpOverlapped;
+      NTSTATUS status = (NTSTATUS)entry.lpOverlapped->Internal;
+      record_result(r, entry.dwNumberOfBytesTransferred,
+                    NT_SUCCESS(status) ? 0 : RtlNtStatusToDosError(status));
       *id = r->id;
     } else if (ok) {
       *id = 0;
     }
     caml_leave_blocking_section();
-    if (!ol && !ok && err != WAIT_TIMEOUT)
-      raise_win32(err, "GetQueuedCompletionStatus");
+    if (!ok && err != WAIT_TIMEOUT && err != WAIT_IO_COMPLETION)
+      raise_win32(err, "GetQueuedCompletionStatusEx");
   }
   CAMLreturn(Val_long(*id));
+}
+
+CAMLprim value iocp_current_thread(value unit) {
+  CAMLparam1(unit);
+  CAMLlocal1(v);
+  ensure_interrupt_tls();
+  v = caml_win32_alloc_handle(INVALID_HANDLE_VALUE);
+  HANDLE process = GetCurrentProcess();
+  if (!DuplicateHandle(process, GetCurrentThread(), process, &Handle_val(v),
+                       THREAD_SET_CONTEXT, FALSE, 0))
+    raise_win32(GetLastError(), "DuplicateHandle");
+  CAMLreturn(v);
+}
+
+static VOID CALLBACK interrupt_wait(ULONG_PTR unused) {
+  (void)unused;
+  TlsSetValue(interrupt_tls, (void *)1);
+}
+
+CAMLprim value iocp_interrupt(value thread) {
+  if (!QueueUserAPC(interrupt_wait, Handle_val(thread), 0))
+    raise_win32(GetLastError(), "QueueUserAPC");
+  return Val_unit;
 }
 
 /*---------------------------------------------------------------------------
