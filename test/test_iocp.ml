@@ -173,7 +173,7 @@ let wake () =
   assert (Iocp.wait p ~timeout:10000 = Some Wake);
   Domain.join d
 
-let sockets () =
+let sockets ~routed () =
   let listener = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
   let client = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
   let accepted = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
@@ -183,17 +183,19 @@ let sockets () =
   Unix.bind listener (ADDR_INET (Unix.inet_addr_loopback, 0));
   Unix.listen listener 1;
   Unix.bind client (ADDR_INET (Unix.inet_addr_any, 0));
-  with_port @@ fun p ->
-  ignore (Iocp.accept p ~data:1 (handle p listener) ~client:accepted);
-  ignore (Iocp.connect p ~data:2 (handle p client) (Unix.getsockname listener));
+  with_port @@ fun home ->
+  (if routed then with_port ~skip_on_success:false else fun fn -> fn home) @@ fun p ->
+  ignore (Iocp.accept p ~data:1 (handle home listener) ~client:accepted);
+  ignore
+    (Iocp.connect p ~data:2 (handle home client) (Unix.getsockname listener));
   let ia, a = delivery p and ib, b = delivery p in
   check "ids" 3 (ia + ib);
   assert (a.error = None && b.error = None);
   assert (Unix.getpeername client = Unix.getsockname listener);
   ignore (Unix.getpeername accepted);
   let buf = Cstruct.create 5 in
-  ignore (Iocp.recv p ~data:3 (handle p accepted) buf);
-  ignore (Iocp.send p ~data:4 (handle p client) (Cstruct.of_string "hello"));
+  ignore (Iocp.recv p ~data:3 (handle home accepted) buf);
+  ignore (Iocp.send p ~data:4 (handle home client) (Cstruct.of_string "hello"));
   let a = status p and b = status p in
   assert (a.error = None && b.error = None);
   check "bytes" 10 (a.bytes_transferred + b.bytes_transferred);
@@ -478,17 +480,24 @@ let datagrams () =
         (Cstruct.to_string (Cstruct.sub buf 0 received.bytes_transferred)))
     [ "hello"; "" ]
 
-let buffered_truncation () =
+let buffered_truncation ~routed () =
   List.iter
     (fun skip_on_success ->
       let udp () = Unix.socket ~cloexec:true PF_INET SOCK_DGRAM 0 in
       let r = udp () and w = udp () in
-      Fun.protect ~finally:(fun () -> close_fd r; close_fd w) @@ fun () ->
-      List.iter (fun s -> Unix.bind s (ADDR_INET (Unix.inet_addr_loopback, 0))) [ r; w ];
-      with_port ~skip_on_success @@ fun p ->
+      Fun.protect ~finally:(fun () ->
+          close_fd r;
+          close_fd w)
+      @@ fun () ->
+      List.iter
+        (fun s -> Unix.bind s (ADDR_INET (Unix.inet_addr_loopback, 0)))
+        [ r; w ];
+      with_port ~skip_on_success @@ fun home ->
+      (if routed then with_port ~skip_on_success else fun fn -> fn home)
+      @@ fun p ->
       ignore (Unix.sendto w (Bytes.of_string "abc") 0 3 [] (Unix.getsockname r));
       let buf = Cstruct.create 1 in
-      let req = Iocp.recvfrom p ~data:1 (handle p r) buf in
+      let req = Iocp.recvfrom p ~data:1 (handle home r) buf in
       let c = match Iocp.result req with Some c -> c | None -> status p in
       assert (c.error = Some Unix.EMSGSIZE);
       assert (c.source = Some (Unix.getsockname w));
@@ -793,6 +802,28 @@ let registered_aliases ~skip_on_success () =
   check "both completions" 3 (ia + ib);
   Alcotest.(check string) "alias contents" "x" (Cstruct.to_string buf)
 
+let routed_pipe () =
+  with_pipe ~skip_on_success:true @@ fun home r w ->
+  let r = handle home r and w = handle home w in
+  with_port @@ fun target ->
+  let buf = Cstruct.create 1 in
+  let read () = Iocp.read target ~data:1 r buf ~offset:0L in
+  let req = read () in
+  invalid (fun () -> Iocp.close_handle r);
+  invalid (fun () -> Iocp.cancel home req);
+  Iocp.cancel target req;
+  assert ((status target).error <> None);
+  ignore (read ());
+  let write = Iocp.write target ~data:2 w (Cstruct.of_string "x") ~offset:0L in
+  assert (Iocp.result write = None);
+  let i, a = delivery target and j, b = delivery target in
+  check "both completions" 3 (i + j);
+  assert (
+    a.error = None && b.error = None && a.bytes_transferred = 1
+    && b.bytes_transferred = 1);
+  Alcotest.(check string) "foreign pipe data" "x" (Cstruct.to_string buf);
+  assert (Iocp.wait home ~timeout:0 = None && Iocp.wait target ~timeout:0 = None)
+
 let registered_pending () =
   with_pipe @@ fun p r w ->
   with_registration p r @@ fun reader ->
@@ -861,6 +892,7 @@ let () =
             ("replaced descriptor", replaced_descriptor);
             ("association ownership", association_ownership);
             ("failed registration", failed_registration);
+            ("cross-port completion and cancellation", routed_pipe);
             ("registered aliases", registered_aliases ~skip_on_success:false);
             ( "registered aliases with immediate completion",
               registered_aliases ~skip_on_success:true );
@@ -884,7 +916,8 @@ let () =
             ("sequential consumer handover", consumer_handover);
             ("retry unacknowledged delivery", retry_delivery);
             ("shutdown preserves queued errors", shutdown_preserves_error);
-            ("buffered datagram truncation", buffered_truncation);
+            ("buffered datagram truncation", buffered_truncation ~routed:false);
+            ("cross-port datagram truncation", buffered_truncation ~routed:true);
             ("receive shutdown", receive_shutdown ~duplicate:false);
             ("receive shutdown through dup", receive_shutdown ~duplicate:true);
             ("file and 64-bit offset", file);
@@ -895,7 +928,8 @@ let () =
             ("submission rollback", submission_failure);
             ("more than 1024 requests", many_requests);
             ("cross-domain wake", wake);
-            ("accept/connect/send/recv", sockets);
+            ("accept/connect/send/recv", sockets ~routed:false);
+            ("cross-port TCP", sockets ~routed:true);
             ("connection refusal", refused);
           ] );
     ]

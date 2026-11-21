@@ -17,6 +17,11 @@
     immediately. [None] means the port delivers it through {!wait}, possibly to
     a consumer already running on another domain.
 
+    The port passed to a submission receives its completion. It may differ
+    from the port used to register the handle. Pending operations need no consumer
+    on the registration port. Cancel a request on its
+    delivery port. Shut down a socket on its registration port.
+
     This example uses a private port with one request and no notifications.
     {[
     let read_at_start port handle buf =
@@ -147,9 +152,8 @@ val cancel_all : 'a t -> unit
 
 (** {1 I/O operations}
 
-    Use the port that owns the registration. A closed registration or the wrong
-    port raises
-    [Invalid_argument]. A Windows error during submission may raise
+    Pass the port that should deliver the result. A closed port or registration
+    raises [Invalid_argument]. A Windows error during submission may raise
     [Unix.Unix_error] directly. In that case there is no completion to drain.
     For a returned request, inspect the [error] field on delivery. Winsock may
     cancel pending socket I/O when the submitting OS thread exits. *)

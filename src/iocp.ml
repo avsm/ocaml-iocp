@@ -35,7 +35,8 @@ type 'a t = {
 and 'a association = {
   key : file_key;
   port_state : 'a t;
-  receives : (int, 'a request) Hashtbl.t;
+  guard : Mutex.t;
+  receives : (file_key, 'a request) Hashtbl.t;
   mutable skip : bool option;
   mutable handles : 'a handle list;
 }
@@ -43,8 +44,7 @@ and 'a association = {
 and 'a handle = {
   association : 'a association;
   fd : Unix.file_descr;
-  mutable pending : int;
-  mutable released : bool;
+  pending : int Atomic.t; (* Negative once closed. *)
 }
 
 and 'a request = {
@@ -53,7 +53,7 @@ and 'a request = {
   data : 'a;
   owner : Raw.port;
   handle : 'a handle;
-  receive : bool;
+  receive_key : file_key option;
   mutable eof_on_cancel : bool;
   mutable immediate : bool;
 }
@@ -85,47 +85,72 @@ let close t =
 
 let check_handle t h =
   check t;
-  if h.released then invalid_arg "Iocp: closed handle";
+  if Atomic.get h.pending < 0 then invalid_arg "Iocp: closed handle";
   if h.association.port_state != t then invalid_arg "Iocp: wrong port"
 
-let file_key h = h.association.key
+let with_receives h receive fn =
+  if receive then Mutex.protect h.association.guard fn else fn ()
 
+let file_key h = h.association.key
 let same_handle = Raw.same_handle
 
 let register t fd =
   locked t (fun () ->
       check t;
-      let a = { key = object end; port_state = t; receives = Hashtbl.create 0; skip = None; handles = [] } in
-      let h = { association = a; fd; pending = 0; released = false } in
-      a.handles <- [h];
+      let a =
+        {
+          key = object end;
+          port_state = t;
+          guard = Mutex.create ();
+          receives = Hashtbl.create 0;
+          skip = None;
+          handles = [];
+        }
+      in
+      let h = { association = a; fd; pending = Atomic.make 0 } in
+      a.handles <- [ h ];
       let files = Files.add a.key a t.files in
       match Raw.associate_port t.port fd with
       | () ->
           t.files <- files;
           h
-      | exception (Unix.Unix_error (EINVAL, _, _) as ex) ->
+      | exception (Unix.Unix_error (EINVAL, _, _) as ex) -> (
           (* Windows rejects a second association, including through a duplicate. *)
-          match Files.to_seq t.files |> Seq.find_map (fun (_, a) ->
-              if Raw.same_handle fd (List.hd a.handles).fd then Some a else None) with
+          match
+            Files.to_seq t.files
+            |> Seq.find_map (fun (_, a) ->
+                if Raw.same_handle fd (List.hd a.handles).fd then Some a
+                else None)
+          with
           | None -> raise ex
           | Some a ->
               let h = { h with association = a } in
               a.handles <- h :: a.handles;
-              h)
+              h))
 
 let close_handle h =
   let a = h.association in
   let t = a.port_state in
   locked t (fun () ->
-      if not h.released then (
-        if h.pending <> 0 then invalid_arg "Iocp.close_handle: handle is busy";
+      if Atomic.get h.pending >= 0 then (
         let remaining = List.filter (fun other -> other != h) a.handles in
-        if remaining = [] then (
-          let files = Files.remove a.key t.files in
-          Raw.detach h.fd;
-          t.files <- files);
-        a.handles <- remaining;
-        h.released <- true))
+        let files =
+          if remaining = [] then Files.remove a.key t.files else t.files
+        in
+        if not (Atomic.compare_and_set h.pending 0 (-1)) then
+          invalid_arg "Iocp.close_handle: handle is busy";
+        (try if remaining = [] then Raw.detach h.fd
+         with ex ->
+           Atomic.set h.pending 0;
+           raise ex);
+        t.files <- files;
+        a.handles <- remaining))
+
+(* A submission on another port can race with closing this registration. *)
+let rec acquire h =
+  let n = Atomic.get h.pending in
+  if n < 0 then invalid_arg "Iocp: closed handle";
+  if not (Atomic.compare_and_set h.pending n (n + 1)) then acquire h
 
 let wake t =
   locked t (fun () ->
@@ -149,10 +174,9 @@ let check_timeout timeout =
   if timeout < -1 || Int64.of_int timeout > 0xffff_fffeL then
     invalid_arg "Iocp: invalid timeout"
 
-let remove_request t r =
+let untrack t r =
   Hashtbl.remove t.requests r.id;
-  if r.receive then Hashtbl.remove r.handle.association.receives r.id;
-  r.handle.pending <- r.handle.pending - 1
+  Option.iter (Hashtbl.remove r.handle.association.receives) r.receive_key
 
 let wait t ~timeout =
   check_timeout timeout;
@@ -186,31 +210,33 @@ let wait t ~timeout =
   | id ->
       locked t (fun () ->
           let r = Hashtbl.find t.requests id in
-          let result = Some (Completion (r.data, Raw.completion r.operation r.eof_on_cancel)) in
-          remove_request t r;
+          with_receives r.handle (Option.is_some r.receive_key) (fun () ->
+              let result = Some (Completion (r.data, Raw.completion r.operation r.eof_on_cancel)) in
+          untrack t r;
+          Atomic.decr r.handle.pending;
           Raw.acknowledge slot;
-          result)
+          result))
 
-let submit ?(receive = false) t ~data h roots fn =
-  locked t (fun () ->
-      check_handle t h;
+let submit_pinned ~receive t ~data h roots fn =
       let rec fresh_id () =
         t.next_id <- if t.next_id = max_int then 1 else t.next_id + 1;
         if Hashtbl.mem t.requests t.next_id then fresh_id () else t.next_id
       in
       let id = fresh_id () in
-      let skip =
-        match h.association.skip with
-        | Some skip -> skip
-        | None ->
-            let skip = Raw.enable_immediate h.fd in
-            h.association.skip <- Some skip;
-            skip
-      in
       let delivery =
-        if not skip then Raw.Native_queue
-        else if t.skip_on_success then Raw.Immediate
-        else Raw.Post_queue
+        if h.association.port_state != t then
+          (if t.skip_on_success then Raw.Forward_immediate else Raw.Forward_queue)
+        else
+          let skip = match h.association.skip with
+            | Some skip -> skip
+            | None ->
+                let skip = Raw.enable_immediate h.fd in
+                h.association.skip <- Some skip;
+                skip
+          in
+          if not skip then Raw.Native_queue
+          else if t.skip_on_success then Raw.Immediate
+          else Raw.Post_queue
       in
       let operation = Raw.allocate t.port id h.fd (h, roots) delivery in
       let r =
@@ -220,24 +246,31 @@ let submit ?(receive = false) t ~data h roots fn =
           data;
           owner = t.port;
           handle = h;
-          receive;
+          receive_key = (if receive then Some (object end) else None);
           eof_on_cancel = false;
           immediate = false;
         }
       in
-      h.pending <- h.pending + 1;
       match
-        if receive then Hashtbl.add h.association.receives id r;
+        Option.iter (fun key -> Hashtbl.add h.association.receives key r) r.receive_key;
         Hashtbl.add t.requests id r;
         fn operation
       with
       | immediate ->
           r.immediate <- immediate;
-          if immediate then remove_request t r;
+          if immediate then untrack t r;
           r
       | exception ex ->
-          remove_request t r;
-          raise ex)
+          untrack t r;
+          raise ex
+
+let submit ?(receive = false) t ~data h roots fn =
+  locked t (fun () ->
+      check t;
+      acquire h;
+      match with_receives h receive (fun () -> submit_pinned ~receive t ~data h roots fn) with
+      | r -> if r.immediate then Atomic.decr h.pending; r
+      | exception ex -> Atomic.decr h.pending; raise ex)
 
 let result r = if r.immediate then Some (Raw.completion r.operation false) else None
 
@@ -308,24 +341,25 @@ let pipe ?(read_async = true) ?(write_async = true) () =
 
 let shutdown t h cmd =
   locked t (fun () ->
-      check_handle t h;
-      (try Unix.shutdown h.fd cmd
-       with Unix.Unix_error (ENOTCONN, _, _) as ex ->
-         (* A duplicated Winsock descriptor can lack the connection context. *)
-         let rec retry = function
-           | [] -> raise ex
-           | other :: rest when other.fd == h.fd -> retry rest
-           | other :: rest -> (
-               try Unix.shutdown other.fd cmd
-               with Unix.Unix_error (ENOTCONN, _, _) -> retry rest)
-         in
-         retry h.association.handles);
-      if cmd <> Unix.SHUTDOWN_SEND then
-        Hashtbl.iter
-          (fun _ r ->
-            r.eof_on_cancel <- true;
-            Raw.cancel_operation r.operation)
-          h.association.receives)
+      Mutex.protect h.association.guard (fun () ->
+          check_handle t h;
+          (try Unix.shutdown h.fd cmd
+           with Unix.Unix_error (ENOTCONN, _, _) as ex ->
+             (* A duplicated Winsock descriptor can lack the connection context. *)
+             let rec retry = function
+               | [] -> raise ex
+               | other :: rest when other.fd == h.fd -> retry rest
+               | other :: rest -> (
+                   try Unix.shutdown other.fd cmd
+                   with Unix.Unix_error (ENOTCONN, _, _) -> retry rest)
+             in
+             retry h.association.handles);
+          if cmd <> Unix.SHUTDOWN_SEND then
+            Hashtbl.iter
+              (fun _ r ->
+                r.eof_on_cancel <- true;
+                Raw.cancel_operation r.operation)
+              h.association.receives))
 
 module Shared = struct
   type 'a t = { raw : 'a; users : int Atomic.t; dispose : 'a -> unit }
