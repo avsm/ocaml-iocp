@@ -81,6 +81,10 @@ val pending : t -> int
 (** Return the number of requests still awaiting delivery through {!wait},
     including I/O still in progress. Wake notifications are excluded. *)
 
+val same_handle : Unix.file_descr -> Unix.file_descr -> bool
+(** Return whether two open descriptors refer to the same Windows kernel object.
+    Both descriptors must remain open during the call. *)
+
 val register : t -> Unix.file_descr -> handle
 (** [register port fd] borrows an overlapped descriptor. Keep [fd] open and
     unchanged, including across [Unix.dup2], until this registration is closed.
@@ -94,6 +98,13 @@ val register : t -> Unix.file_descr -> handle
     first submission can enable Windows' skip-on-success notification mode even
     for a port using queued delivery. Windows retains this mode after detach. A
     subsequent native consumer must handle synchronous success itself. *)
+
+type file_key
+(** Identifies an association by physical equality across live aliases. *)
+
+val file_key : handle -> file_key
+(** Return the shared key for this registration. Registering the file again
+    after the last registration closes creates a fresh key. *)
 
 val close_handle : handle -> unit
 (** Close a registration. Repeated calls have no effect. Raise

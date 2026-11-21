@@ -107,13 +107,20 @@ CAMLprim value iocp_close(value v) {
   }
   return Val_unit;
 }
-CAMLprim value iocp_same_handle(value a, value b) {
-  typedef BOOL (WINAPI *compare_fn)(HANDLE, HANDLE);
-  compare_fn compare = (compare_fn)GetProcAddress(
+static INIT_ONCE compare_once = INIT_ONCE_STATIC_INIT;
+static BOOL (WINAPI *compare_handles)(HANDLE, HANDLE);
+
+static BOOL CALLBACK init_compare(INIT_ONCE *once, void *param, void **context) {
+  (void)once; (void)param; (void)context;
+  compare_handles = (BOOL (WINAPI *)(HANDLE, HANDLE))GetProcAddress(
       GetModuleHandleW(L"kernelbase.dll"), "CompareObjectHandles");
-  if (!compare)
+  return compare_handles != NULL;
+}
+
+CAMLprim value iocp_same_handle(value a, value b) {
+  if (!InitOnceExecuteOnce(&compare_once, init_compare, NULL, NULL))
     caml_failwith("Iocp: CompareObjectHandles is unavailable");
-  return Val_bool(compare(Handle_val(a), Handle_val(b)));
+  return Val_bool(compare_handles(Handle_val(a), Handle_val(b)));
 }
 CAMLprim value iocp_associate(value v, value fd) {
   if (!CreateIoCompletionPort(Handle_val(fd), port(v), 0, 0))

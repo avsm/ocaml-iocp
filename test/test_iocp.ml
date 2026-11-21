@@ -774,9 +774,13 @@ let registered_aliases ~skip_on_success () =
   with_pipe ~skip_on_success @@ fun p r w ->
   let alias = Unix.dup ~cloexec:true r in
   Fun.protect ~finally:(fun () -> Unix.close alias) @@ fun () ->
+  assert (Iocp.same_handle r alias);
+  assert (not (Iocp.same_handle r w));
   with_registration p r @@ fun original ->
   with_registration p alias @@ fun duplicate ->
   with_registration p w @@ fun writer ->
+  assert (Iocp.file_key original == Iocp.file_key duplicate);
+  assert (Iocp.file_key original != Iocp.file_key writer);
   let buf = Cstruct.create 1 in
   let read = Iocp.read p ~id:1 duplicate buf ~offset:0L in
   invalid (fun () -> Iocp.close_handle duplicate);
