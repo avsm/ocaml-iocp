@@ -89,6 +89,8 @@ let check_handle t h =
 
 let file_key h = h.association.key
 
+let same_handle = Raw.same_handle
+
 let register t fd =
   locked t (fun () ->
       check t;

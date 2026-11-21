@@ -87,6 +87,10 @@ val pending : 'a t -> int
 (** Return the number of requests still awaiting delivery through {!wait},
     including I/O still in progress. Wake notifications are excluded. *)
 
+val same_handle : Unix.file_descr -> Unix.file_descr -> bool
+(** Return whether two open descriptors refer to the same Windows kernel object.
+    Both descriptors must remain open during the call. *)
+
 val register : 'a t -> Unix.file_descr -> 'a handle
 (** [register port fd] borrows an overlapped descriptor. Keep [fd] open and
     unchanged, including across [Unix.dup2], until this registration is closed.

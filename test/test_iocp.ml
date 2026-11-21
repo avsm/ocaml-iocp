@@ -774,6 +774,8 @@ let registered_aliases ~skip_on_success () =
   with_pipe ~skip_on_success @@ fun p r w ->
   let alias = Unix.dup ~cloexec:true r in
   Fun.protect ~finally:(fun () -> Unix.close alias) @@ fun () ->
+  assert (Iocp.same_handle r alias);
+  assert (not (Iocp.same_handle r w));
   with_registration p r @@ fun original ->
   with_registration p alias @@ fun duplicate ->
   with_registration p w @@ fun writer ->
