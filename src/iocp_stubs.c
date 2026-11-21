@@ -56,19 +56,11 @@ static void raise_win32(DWORD err, const char *name) {
   caml_win32_maperr(err);
   caml_uerror(name, Nothing);
 }
-/* Windows may dequeue a packet while the OCaml runtime lock is released. */
-typedef struct {
-  HANDLE handle;
-  intnat ready_id; /* -1 for an empty slot, 0 for a wake notification. */
-} port_state;
-#define State(v) (*(port_state **)Data_custom_val(v))
-#define Port(v) (State(v)->handle)
+#define Port(v) (*(HANDLE *)Data_custom_val(v))
+
 static void finalize_port(value v) {
-  if (State(v) != NULL) {
-    if (Port(v) != NULL)
-      CloseHandle(Port(v));
-    caml_stat_free(State(v));
-  }
+  if (Port(v) != NULL)
+    CloseHandle(Port(v));
 }
 static struct custom_operations port_ops = {"iocp.port",
                                             finalize_port,
@@ -86,11 +78,7 @@ static HANDLE port(value v) {
 CAMLprim value iocp_create(value unit) {
   CAMLparam1(unit);
   CAMLlocal1(v);
-  v = caml_alloc_custom_mem(&port_ops, sizeof(port_state *), sizeof(port_state));
-  State(v) = NULL;
-  port_state *state = caml_stat_alloc(sizeof(*state));
-  State(v) = state;
-  state->ready_id = -1;
+  v = caml_alloc_custom(&port_ops, sizeof(HANDLE), 0, 1);
   Port(v) = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, MAXDWORD);
   if (Port(v) == NULL)
     raise_win32(GetLastError(), "CreateIoCompletionPort");
@@ -421,33 +409,29 @@ CAMLprim value iocp_cancel(value v) {
   }
   return Val_unit;
 }
-CAMLprim value iocp_dequeue(value p, value timeout) {
-  CAMLparam2(p, timeout);
-  port_state *state = State(p);
-  if (state->ready_id < 0) {
+CAMLprim value iocp_dequeue(value p, value slot, value timeout) {
+  CAMLparam3(p, slot, timeout);
+  HANDLE h = port(p);
+  intnat *id = Caml_ba_data_val(slot);
+  if (*id < 0) {
     DWORD bytes, ms = (DWORD)Long_val(timeout);
     ULONG_PTR key;
     OVERLAPPED *ol = NULL;
     caml_enter_blocking_section();
-    BOOL ok = GetQueuedCompletionStatus(state->handle, &bytes, &key, &ol, ms);
+    BOOL ok = GetQueuedCompletionStatus(h, &bytes, &key, &ol, ms);
     DWORD err = ok ? 0 : GetLastError();
     if (ol) {
       request *r = (request *)ol;
       record_result(r, bytes, err);
-      state->ready_id = r->id;
+      *id = r->id;
     } else if (ok) {
-      state->ready_id = 0;
+      *id = 0;
     }
     caml_leave_blocking_section();
     if (!ol && !ok && err != WAIT_TIMEOUT)
       raise_win32(err, "GetQueuedCompletionStatus");
   }
-  CAMLreturn(Val_long(state->ready_id));
-}
-
-CAMLprim value iocp_acknowledge(value p) {
-  State(p)->ready_id = -1;
-  return Val_unit;
+  CAMLreturn(Val_long(*id));
 }
 
 /*---------------------------------------------------------------------------

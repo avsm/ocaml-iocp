@@ -11,6 +11,8 @@ type completion = Raw.completion = {
   source : Unix.sockaddr option;
 }
 
+type waiter = { slot : Raw.slot; mutable busy : bool }
+
 type t = {
   port : Raw.port;
   skip_on_success : bool;
@@ -18,7 +20,7 @@ type t = {
   requests : (int, request) Hashtbl.t;
   mutable registered : int;
   mutable closed : bool;
-  mutable waiting : bool;
+  mutable waiters : waiter list;
 }
 
 and association = {
@@ -57,7 +59,7 @@ let create ?(skip_on_success = false) () =
     lock = Mutex.create ();
     requests = Hashtbl.create 16;
     closed = false;
-    waiting = false;
+    waiters = [];
   }
 
 let pending t = locked t (fun () -> Hashtbl.length t.requests)
@@ -65,8 +67,8 @@ let pending t = locked t (fun () -> Hashtbl.length t.requests)
 let close t =
   locked t (fun () ->
       if not t.closed then (
-        if t.waiting || t.registered <> 0 || Hashtbl.length t.requests <> 0 then
-          invalid_arg "Iocp.close: port is busy";
+        if List.exists (fun w -> w.busy) t.waiters || t.registered <> 0 || Hashtbl.length t.requests <> 0
+        then invalid_arg "Iocp.close: port is busy";
         Raw.close_port t.port;
         t.closed <- true))
 
@@ -144,19 +146,32 @@ let check_timeout timeout =
 
 let wait t ~timeout =
   check_timeout timeout;
-  let claimed = ref false in
-  let release () = t.waiting <- false in
-  Fun.protect ~finally:(fun () -> if !claimed then locked t release)
-  @@ fun () ->
-  locked t (fun () ->
+  let claimed = ref None in
+  let release () = Option.iter (fun w -> w.busy <- false) !claimed in
+  Fun.protect ~finally:(fun () -> locked t release) @@ fun () ->
+  let slot = locked t (fun () ->
       check t;
-      if t.waiting then invalid_arg "Iocp.wait: concurrent consumer";
-      t.waiting <- true;
-      claimed := true);
-  match Raw.dequeue t.port timeout with
+      (* A failed delivery keeps its packet in the slot for the next waiter. *)
+      let rec choose idle = function
+        | w :: rest when w.busy -> choose idle rest
+        | w :: _ when w.slot.{0} >= 0 -> w
+        | w :: rest -> choose (Some w) rest
+        | [] -> (match idle with
+            | Some w -> w
+            | None ->
+              let w = { slot = Raw.slot (); busy = false } in
+              t.waiters <- w :: t.waiters;
+              w)
+      in
+      let w = choose None t.waiters in
+      claimed := Some w;
+      w.busy <- true;
+      w.slot)
+  in
+  match Raw.dequeue t.port slot timeout with
   | -1 -> None
   | 0 ->
-      Raw.acknowledge t.port;
+      Raw.acknowledge slot;
       notification
   | id ->
       locked t (fun () ->
@@ -164,7 +179,7 @@ let wait t ~timeout =
           let result = Raw.completion r.operation r.eof_on_cancel in
           Hashtbl.remove t.requests id;
           r.handle.pending <- r.handle.pending - 1;
-          Raw.acknowledge t.port;
+          Raw.acknowledge slot;
           result)
 
 let submit ?(receive = false) t ~id h roots fn =

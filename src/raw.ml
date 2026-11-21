@@ -22,11 +22,18 @@ type completion = {
   source : Unix.sockaddr option;
 }
 
-external dequeue : port -> int -> int = "iocp_dequeue"
-(** Return the oldest packet's ID, or [-1] on timeout. Repeat that ID until
-    [acknowledge] commits delivery. Both functions require the consumer lock. *)
+type slot = (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
 
-external acknowledge : port -> unit = "iocp_acknowledge" [@@noalloc]
+let slot () =
+  let s = Bigarray.Array1.create Bigarray.int Bigarray.c_layout 1 in
+  s.{0} <- -1;
+  s
+
+external dequeue : port -> slot -> int -> int = "iocp_dequeue"
+(** A slot retains its packet across exceptions until acknowledged. *)
+
+let acknowledge slot = slot.{0} <- -1
+
 external completion : operation -> bool -> completion option = "iocp_completion"
 
 type delivery = Native_queue | Post_queue | Immediate
