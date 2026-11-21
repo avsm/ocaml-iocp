@@ -272,12 +272,11 @@ static value completion(request *r, int eof_on_cancel) {
     code = caml_unix_error_of_code(errno);
     error = caml_alloc_some(code);
   }
-  result = caml_alloc_tuple(4);
-  Store_field(result, 0, Val_long(r->id));
-  Store_field(result, 1, Val_long(bytes));
-  Store_field(result, 2, error);
-  Store_field(result, 3, source);
-  CAMLreturn(caml_alloc_some(result));
+  result = caml_alloc_tuple(3);
+  Store_field(result, 0, Val_long(bytes));
+  Store_field(result, 1, error);
+  Store_field(result, 2, source);
+  CAMLreturn(result);
 }
 static value complete_immediately(request *r, DWORD bytes, DWORD err) {
   record_result(r, bytes, err);

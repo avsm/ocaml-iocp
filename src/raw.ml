@@ -16,7 +16,6 @@ external enable_immediate : Unix.file_descr -> bool = "iocp_enable_immediate"
 external wake_port : port -> unit = "iocp_wake"
 
 type completion = {
-  id : int;
   bytes_transferred : int;
   error : Unix.error option;
   source : Unix.sockaddr option;
@@ -36,7 +35,7 @@ let acknowledge slot = slot.{0} <- -1
 
 external current_thread : unit -> Unix.file_descr = "iocp_current_thread"
 external interrupt : Unix.file_descr -> unit = "iocp_interrupt"
-external completion : operation -> bool -> completion option = "iocp_completion"
+external completion : operation -> bool -> completion = "iocp_completion"
 
 type delivery = Native_queue | Post_queue | Immediate
 

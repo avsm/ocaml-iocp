@@ -10,22 +10,26 @@
 
     {1:delivery Completion delivery}
 
-    Give each outstanding operation a positive ID and use the ID to dispatch its
-    completion. Completions may arrive in any order. The default port queues one
-    completion per successful submission. With [skip_on_success] enabled, check
+    Attach an OCaml value to each submission. A queued completion returns this
+    value to the consumer. Completions may arrive in any order. The default port
+    queues one completion per successful submission. With [skip_on_success] enabled, check
     {!result} on the returned request. [Some c] delivers the completion
     immediately. [None] means the port delivers it through {!wait}, possibly to
-    a consumer already running on another domain. Reserve the ID and publish any
-    dispatch state before submitting.
+    a consumer already running on another domain.
 
     This example uses a private port with one request and no notifications.
     {[
     let read_at_start port handle buf =
-      let req = Iocp.read port ~id:1 handle buf ~offset:0L in
+      let req = Iocp.read port ~data:() handle buf ~offset:0L in
       let c =
         match Iocp.result req with
         | Some c -> c
-        | None -> Option.get (Iocp.wait port ~timeout:(-1))
+        | None ->
+          let rec wait () = match Iocp.wait port ~timeout:(-1) with
+            | Some (Iocp.Completion ((), c)) -> c
+            | Some Wake | None -> wait ()
+          in
+          wait ()
       in
       match c.error with
       | None -> c.bytes_transferred
@@ -37,24 +41,23 @@
     The caller owns the descriptor. A {!handle} borrows it until {!close_handle}
     returns. The library keeps submitted buffers reachable. Keep each submitted
     byte range, including overlapping slices, untouched until its completion is
-    delivered. At that point the range and ID may be reused.
+    delivered. At that point the range may be reused.
 
     To shut down a port, stop new submissions, request cancellation if needed,
     and drain outstanding completions. Close each registration, then close the
     port. Close the underlying descriptors separately. *)
 
-type t
+type 'a t
 (** A completion port and its outstanding requests. *)
 
-type handle
+type 'a handle
 (** A borrowed registration of an overlapped handle with a port. *)
 
-type request
+type 'a request
 (** A submission token for {!cancel} and {!result}. It may be discarded while
     the port is awaiting its completion. *)
 
 type completion = {
-  id : int;  (** Identifies the request, or is zero for a notification. *)
   bytes_transferred : int;
       (** Counts the bytes transferred. A failed operation may report a partial
           transfer. *)
@@ -65,23 +68,26 @@ type completion = {
 }
 (** Describes a completed operation. *)
 
+type 'a event = Wake | Completion of 'a * completion
+(** A wake notification or the submitted value and its I/O result. *)
+
 (** {1 Completion ports} *)
 
-val create : ?skip_on_success:bool -> unit -> t
+val create : ?skip_on_success:bool -> unit -> 'a t
 (** Create a port. By default, {!wait} delivers every completion. If
     [skip_on_success] is true, supported handles deliver immediate completions
     through {!result}. Check {!result} after every submission in this mode. *)
 
-val close : t -> unit
+val close : 'a t -> unit
 (** Close the port. Repeated calls have no effect. Raise [Invalid_argument] if a
     consumer is waiting, requests remain pending or registrations remain open.
 *)
 
-val pending : t -> int
+val pending : 'a t -> int
 (** Return the number of requests still awaiting delivery through {!wait},
     including I/O still in progress. Wake notifications are excluded. *)
 
-val register : t -> Unix.file_descr -> handle
+val register : 'a t -> Unix.file_descr -> 'a handle
 (** [register port fd] borrows an overlapped descriptor. Keep [fd] open and
     unchanged, including across [Unix.dup2], until this registration is closed.
     Each successful call requires its own {!close_handle}. Duplicated
@@ -98,90 +104,89 @@ val register : t -> Unix.file_descr -> handle
 type file_key
 (** Identifies an association by physical equality across live aliases. *)
 
-val file_key : handle -> file_key
+val file_key : 'a handle -> file_key
 (** Return the shared key for this registration. Registering the file again
     after the last registration closes creates a fresh key. *)
 
-val close_handle : handle -> unit
+val close_handle : 'a handle -> unit
 (** Close a registration. Repeated calls have no effect. Raise
     [Invalid_argument] while its requests remain pending. Closing the last
     registration detaches the object from the port, allowing later registration
     with another port. The original descriptor remains open and belongs to the
     caller. *)
 
-val wake : t -> unit
-(** Queue a notification with [id = 0], zero bytes and no error or source
-    address. This function may be called from another thread or domain. *)
+val wake : 'a t -> unit
+(** Queue a [Wake] notification. This function may be called from another thread or domain. *)
 
-val wait : t -> timeout:int -> completion option
+val wait : 'a t -> timeout:int -> 'a event option
 (** Consume the next queued completion, or return [None] on timeout or
     interruption. [timeout] is in milliseconds. Zero polls and [-1] waits
     indefinitely. Raise [Invalid_argument] for other negative values. Finite
     timeouts must not exceed [0xffff_fffe]. If constructing a completion raises
     [Out_of_memory], another call to [wait] can collect the packet. *)
 
-val result : request -> completion option
+val result : 'a request -> completion option
 (** Return an immediate completion, if one was produced during submission.
     Otherwise return [None], even if {!wait} has since consumed the completion.
     Immediate completions are not queued and do not count towards {!pending}. If
     constructing the result raises [Out_of_memory], call [result] again. *)
 
-val cancel : t -> request -> unit
+val cancel : 'a t -> 'a request -> unit
 (** Request cancellation. Cancellation may race with successful completion. A
     pending request still requires a delivery through {!wait}. Cancelling a
     completed request has no effect. Raise [Invalid_argument] if the request
     belongs to another port. *)
 
-val cancel_all : t -> unit
+val cancel_all : 'a t -> unit
 (** Request cancellation of all pending operations. Drain them with {!wait}
     before closing the port. *)
 
 (** {1 I/O operations}
 
-    Use the port that owns the registration. A closed registration, the wrong
-    port, a non-positive ID or an outstanding duplicate ID raises
+    Use the port that owns the registration. A closed registration or the wrong
+    port raises
     [Invalid_argument]. A Windows error during submission may raise
     [Unix.Unix_error] directly. In that case there is no completion to drain.
     For a returned request, inspect the [error] field on delivery. Winsock may
     cancel pending socket I/O when the submitting OS thread exits. *)
 
-val read : t -> id:int -> handle -> Cstruct.t -> offset:int64 -> request
+val read : 'a t -> data:'a -> 'a handle -> Cstruct.t -> offset:int64 -> 'a request
 (** Read into the buffer at the given file offset. Use a non-negative offset for
     files and [0L] for pipes. End of input completes successfully with zero
     bytes. *)
 
-val write : t -> id:int -> handle -> Cstruct.t -> offset:int64 -> request
+val write : 'a t -> data:'a -> 'a handle -> Cstruct.t -> offset:int64 -> 'a request
 (** Write from the buffer at the given file offset. Use a non-negative offset
     for files, [-1L] for atomic append, and [0L] for pipes. *)
 
-val recv : t -> id:int -> handle -> Cstruct.t -> request
+val recv : 'a t -> data:'a -> 'a handle -> Cstruct.t -> 'a request
 (** Receive stream data into the buffer. End of input completes successfully
     with zero bytes. *)
 
-val send : t -> id:int -> handle -> Cstruct.t -> request
+val send : 'a t -> data:'a -> 'a handle -> Cstruct.t -> 'a request
 (** Send stream data from the buffer. The completion reports the number of bytes
     sent, which may be less than the buffer length. *)
 
-val recvfrom : t -> id:int -> handle -> Cstruct.t -> request
+val recvfrom : 'a t -> data:'a -> 'a handle -> Cstruct.t -> 'a request
 (** Receive a datagram into the buffer. The completion includes its source
     address. A zero-length datagram preserves its source address. An oversized
     datagram reports [EMSGSIZE] with the copied byte count and source address. *)
 
-val sendto : t -> id:int -> handle -> Cstruct.t -> Unix.sockaddr -> request
+val sendto : 'a t -> data:'a -> 'a handle -> Cstruct.t -> Unix.sockaddr -> 'a request
 (** Send the buffer as one datagram to the given address. *)
 
-val accept : t -> id:int -> handle -> client:Unix.file_descr -> request
+val accept : 'a t -> data:'a -> 'a handle -> client:Unix.file_descr -> 'a request
 (** Accept a connection into [client], an unbound, unconnected socket of the
     listener's family and type. The caller supplies and owns [client]. Reserve
     it exclusively for this accept until completion. On success,
     [Unix.getpeername client] returns the peer and {!register} can register
     [client] for further I/O. *)
 
-val connect : t -> id:int -> handle -> Unix.sockaddr -> request
+val connect : 'a t -> data:'a -> 'a handle -> Unix.sockaddr -> 'a request
 (** Connect a bound socket to the given address. Successful completion updates
     its connection context. *)
 
-val shutdown : t -> handle -> Unix.shutdown_command -> unit
+val shutdown : 'a t -> 'a handle -> Unix.shutdown_command -> unit
 (** Shut down a socket. Receive shutdown also cancels outstanding receives on
     this port, including receives through duplicated descriptors. An aborted
     receive then completes successfully with zero bytes and no source address. A

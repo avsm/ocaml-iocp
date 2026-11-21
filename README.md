@@ -3,14 +3,14 @@
 Windows 10 and later I/O completion ports for OCaml 5.2 and later.
 
 The library provides file and pipe reads/writes, socket and datagram send/receive,
-AcceptEx, ConnectEx, cancellation, and cross-thread notifications. Request IDs
-are ordinary positive integers. Buffers and request storage remain rooted until
+AcceptEx, ConnectEx, cancellation, and cross-thread notifications. Each submission carries an
+OCaml value returned with its queued completion. Buffers and request storage remain rooted until
 completion is consumed, including when cancellation races with successful I/O.
 There is no fixed limit on the number of outstanding requests.
 
 ## Ownership
 
-- Use one completion consumer per port. Submission and cancellation are thread-safe.
+- Multiple threads may submit, cancel and consume completions on a port.
 - Call `Iocp.register port fd` before submitting I/O. The returned handle borrows
   the descriptor; keep it open and unchanged until `Iocp.close_handle` returns.
 - Aliases can register with the same port. Registering an alias with another port
@@ -37,12 +37,14 @@ let read_file path =
   let handle = Iocp.register port fd in
   Fun.protect ~finally:(fun () -> Iocp.close_handle handle) @@ fun () ->
   let buf = Cstruct.create 4096 in
-  ignore (Iocp.read port ~id:1 handle buf ~offset:0L);
-  match Iocp.wait port ~timeout:(-1) with
-  | Some { error = None; bytes_transferred; _ } ->
+  ignore (Iocp.read port ~data:() handle buf ~offset:0L);
+  let rec receive () = match Iocp.wait port ~timeout:(-1) with
+  | Some (Iocp.Completion ((), { error = None; bytes_transferred; _ })) ->
       Cstruct.to_string ~len:bytes_transferred buf
-  | Some { error = Some e; _ } -> raise (Unix.Unix_error (e, "read", path))
-  | None -> assert false
+  | Some (Completion ((), { error = Some e; _ })) -> raise (Unix.Unix_error (e, "read", path))
+  | Some Wake | None -> receive ()
+  in
+  receive ()
 ```
 
 `Iocp.pipe` creates private byte pipes with non-inheritable handles. Choose
