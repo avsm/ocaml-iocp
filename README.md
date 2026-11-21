@@ -16,6 +16,9 @@ There is no fixed limit on the number of outstanding requests.
 - Aliases can register with the same port. Registering an alias with another port
   fails while any registration remains open. Closing the last registration
   detaches the object, allowing it to be registered again later.
+- Submit a registered handle on the port where its consumer waits. When the
+  ports differ, Windows delivers the operation to the submitting port, even
+  after the thread that registered the handle exits.
 - Descriptors must support overlapped I/O. Do not change their completion
   notification modes or issue overlapped I/O outside this library.
 - Cancellation requests completion; it does not release the request's buffers.

@@ -167,7 +167,7 @@ CAMLprim value iocp_wake(value v) {
   -----------------------------------------------------------------------*/
 
 /* Matches Raw.delivery. */
-enum delivery { NATIVE_QUEUE, POST_QUEUE, IMMEDIATE };
+enum delivery { NATIVE_QUEUE, POST_QUEUE, IMMEDIATE, FORWARD_QUEUE, FORWARD_IMMEDIATE };
 
 /* Constant constructors of Raw.buffer_op come first, in declaration order. */
 enum operation_kind { OP_READ, OP_WRITE, OP_RECV, OP_SEND, OP_RECVFROM, OP_SENDTO, OP_ACCEPT, OP_CONNECT };
@@ -175,6 +175,7 @@ enum operation_kind { OP_READ, OP_WRITE, OP_RECV, OP_SEND, OP_RECVFROM, OP_SENDT
 typedef struct {
   OVERLAPPED overlapped; /* Must be first: completion packets return this address. */
   HANDLE fd;
+  HANDLE event, packet;
   SOCKET client;
   enum operation_kind kind;
   intnat id;
@@ -224,13 +225,38 @@ CAMLprim value iocp_allocate(value p, value id, value fd, value buffers, value d
   Store_field(v, 3, buffers);
   CAMLreturn(v);
 }
+/* A tagged event suppresses the file's ordinary packet. Associate the event
+   with the submitting port only when the operation must wait. */
+static DWORD route_pending(request *r, HANDLE destination) {
+  typedef NTSTATUS (NTAPI *create_fn)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+  typedef NTSTATUS (NTAPI *associate_fn)(HANDLE, HANDLE, HANDLE, PVOID, PVOID,
+                                         NTSTATUS, ULONG_PTR, PBOOLEAN);
+  HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+  create_fn create = (create_fn)GetProcAddress(nt, "NtCreateWaitCompletionPacket");
+  associate_fn associate = (associate_fn)GetProcAddress(nt, "NtAssociateWaitCompletionPacket");
+  if (!create || !associate) return ERROR_CALL_NOT_IMPLEMENTED;
+  NTSTATUS status = create(&r->packet, MAXIMUM_ALLOWED, NULL);
+  if (NT_SUCCESS(status))
+    status = associate(r->packet, destination, r->event, NULL, &r->overlapped, 0, 0, NULL);
+  return NT_SUCCESS(status) ? ERROR_SUCCESS : RtlNtStatusToDosError(status);
+}
+
 static void start(value v) {
   request *r = Request(v);
+  if (r->delivery >= FORWARD_QUEUE) {
+    r->event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!r->event) raise_win32(GetLastError(), "CreateEventW");
+    r->overlapped.hEvent = (HANDLE)((uintptr_t)r->event | 1);
+  }
   r->roots = v;
   caml_register_generational_global_root(&r->roots);
   r->pending = 1;
 }
 static void finish(request *r) {
+  if (r->event) {
+    if (r->packet) CloseHandle(r->packet);
+    CloseHandle(r->event);
+  }
   Store_field(r->roots, 3, Val_unit);
   r->pending = 0;
   caml_remove_generational_global_root(&r->roots);
@@ -292,6 +318,21 @@ static value complete_immediately(request *r, DWORD bytes, DWORD err) {
 }
 
 static value submitted(request *r, DWORD err, const char *op) {
+  if (r->event && err == ERROR_IO_PENDING) {
+    DWORD routing_error = route_pending(r, port(Field(r->roots, 1)));
+    if (!routing_error) return Val_false;
+    /* The kernel already owns the buffer. Drain cancellation before reporting
+       the routing error, preserving any result that won the race. */
+    caml_enter_blocking_section_no_pending();
+    CancelIoEx(r->fd, &r->overlapped);
+    WaitForSingleObject(r->event, INFINITE);
+    caml_leave_blocking_section();
+    if (r->packet) { CloseHandle(r->packet); r->packet = NULL; }
+    if (RtlNtStatusToDosError((NTSTATUS)r->overlapped.Internal) == ERROR_OPERATION_ABORTED)
+      err = routing_error;
+    else
+      err = ERROR_SUCCESS;
+  }
   if (err != ERROR_SUCCESS && err != ERROR_IO_PENDING) {
     finish(r);
     raise_win32(err, op);
@@ -303,7 +344,7 @@ static value submitted(request *r, DWORD err, const char *op) {
         err = WSAGetLastError();
     } else if (!GetOverlappedResult(r->fd, &r->overlapped, &bytes, FALSE))
       err = GetLastError();
-    if (r->delivery == IMMEDIATE)
+    if (r->delivery == IMMEDIATE || r->delivery == FORWARD_IMMEDIATE)
       return complete_immediately(r, bytes, err);
     r->error = err;
     if (!PostQueuedCompletionStatus(port(Field(r->roots, 1)), bytes, 0, &r->overlapped)) {
@@ -370,7 +411,7 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
   }
   if ((r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) ||
       (r->kind == OP_RECV && err == WSAESHUTDOWN)) {
-    if (r->delivery == IMMEDIATE)
+    if (r->delivery == IMMEDIATE || r->delivery == FORWARD_IMMEDIATE)
       CAMLreturn(complete_immediately(r, 0, 0));
     if (PostQueuedCompletionStatus(port(Field(v, 1)), 0, 0, &r->overlapped))
       CAMLreturn(Val_false);
@@ -448,9 +489,9 @@ CAMLprim value iocp_dequeue(value p, value slot, value timeout) {
     TlsSetValue(interrupt_tls, NULL);
     if (ok && entry.lpOverlapped) {
       request *r = (request *)entry.lpOverlapped;
-      NTSTATUS status = (NTSTATUS)entry.lpOverlapped->Internal;
-      record_result(r, entry.dwNumberOfBytesTransferred,
-                    NT_SUCCESS(status) ? 0 : RtlNtStatusToDosError(status));
+      NTSTATUS status = (NTSTATUS)r->overlapped.Internal;
+      DWORD bytes = r->packet ? (DWORD)r->overlapped.InternalHigh : entry.dwNumberOfBytesTransferred;
+      record_result(r, bytes, NT_SUCCESS(status) ? 0 : RtlNtStatusToDosError(status));
       *id = r->id;
     } else if (ok) {
       *id = 0;

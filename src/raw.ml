@@ -37,7 +37,7 @@ external current_thread : unit -> Unix.file_descr = "iocp_current_thread"
 external interrupt : Unix.file_descr -> unit = "iocp_interrupt"
 external completion : operation -> bool -> completion = "iocp_completion"
 
-type delivery = Native_queue | Post_queue | Immediate
+type delivery = Native_queue | Post_queue | Immediate | Forward_queue | Forward_immediate
 
 external allocate :
   port -> int -> Unix.file_descr -> 'a -> delivery -> operation
