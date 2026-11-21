@@ -5,7 +5,8 @@
 
     A port delivers completions for operations on registered files, pipes and
     sockets. Threads and domains may submit and cancel requests concurrently.
-    Each port admits one caller of {!wait} at a time.
+    Several threads may wait on the same port. Each queued packet is delivered
+    once.
 
     {1:delivery Completion delivery}
 
@@ -106,12 +107,10 @@ val wake : t -> unit
     address. This function may be called from another thread or domain. *)
 
 val wait : t -> timeout:int -> completion option
-(** Consume the next queued completion, or return [None] on timeout. [timeout]
-    is in milliseconds. Zero polls and [-1] waits indefinitely. Raise
-    [Invalid_argument] for concurrent consumers or other negative values. Finite
-    timeouts must not exceed [0xffff_fffe]. Sequential calls may use different
-    OS threads. If constructing the completion raises [Out_of_memory], retry
-    [wait] to collect the same packet. *)
+(** Consume the next queued completion, or return [None] on timeout. [timeout] is in milliseconds. Zero polls and [-1] waits
+    indefinitely. Raise [Invalid_argument] for other negative values. Finite
+    timeouts must not exceed [0xffff_fffe]. If constructing a completion raises
+    [Out_of_memory], another call to [wait] can collect the packet. *)
 
 val result : request -> completion option
 (** Return an immediate completion, if one was produced during submission.

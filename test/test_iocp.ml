@@ -280,6 +280,7 @@ let shutdown_preserves_error () =
 
 (* Model a failure while converting a dequeued packet, before delivery commits. *)
 let retry_delivery () =
+  let slot = Raw.slot () in
   let p = Raw.create_port () in
   Fun.protect ~finally:(fun () -> Raw.close_port p) @@ fun () ->
   let rd, wr = Iocp.pipe () in
@@ -292,7 +293,7 @@ let retry_delivery () =
   let buf = Cstruct.of_string "x" in
   let op = Raw.allocate p 1 wr buf Raw.Native_queue in
   ignore (Raw.submit_buffer op Raw.Write_file buf 0L);
-  check "first delivery" 1 (Raw.dequeue p 10000);
+  check "first delivery" 1 (Raw.dequeue p slot 10000);
   let first = Raw.completion op false in
   assert (
     match first with
@@ -300,12 +301,12 @@ let retry_delivery () =
     | None -> false);
   Raw.wake_port p;
   Gc.compact ();
-  check "retry the same packet" 1 (Raw.dequeue p 0);
+  check "retry the same packet" 1 (Raw.dequeue p slot 0);
   assert (Raw.completion op false = first);
-  Raw.acknowledge p;
-  check "next packet" 0 (Raw.dequeue p 0);
-  Raw.acknowledge p;
-  check "queue drained" (-1) (Raw.dequeue p 0)
+  Raw.acknowledge slot;
+  check "next packet" 0 (Raw.dequeue p slot 0);
+  Raw.acknowledge slot;
+  check "queue drained" (-1) (Raw.dequeue p slot 0)
 
 let consumer_handover () =
   let run wake wait =
@@ -332,6 +333,13 @@ let consumer_handover () =
   in
   with_port (fun p ->
       run (fun () -> Iocp.wake p) (fun timeout -> Iocp.wait p ~timeout <> None))
+
+let concurrent_delivery () =
+  with_pipe @@ fun p r w ->
+  let readers = Array.init 2 (fun _ -> Domain.spawn (fun () -> (status p).id)) in
+  ignore (Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L);
+  ignore (Iocp.write p ~id:2 (handle p w) (Cstruct.of_string "x") ~offset:0L);
+  assert (Array.to_list (Array.map Domain.join readers) |> List.sort compare = [1; 2])
 
 let cancel_race () =
   with_pipe @@ fun p r w ->
@@ -820,6 +828,7 @@ let () =
             ("cross-domain submission", cross_domain_submit);
             ("closed port", closed_port);
             ("wrong-port cancellation", wrong_port);
+            ("concurrent completion delivery", concurrent_delivery);
             ("sequential consumer handover", consumer_handover);
             ("retry unacknowledged delivery", retry_delivery);
             ("shutdown preserves queued errors", shutdown_preserves_error);
