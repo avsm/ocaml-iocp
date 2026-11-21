@@ -5,11 +5,12 @@
   ----------------------------------------------------------------------*)
 
 type completion = Raw.completion = {
-  id : int;
   bytes_transferred : int;
   error : Unix.error option;
   source : Unix.sockaddr option;
 }
+
+type 'a event = Wake | Completion of 'a * completion
 
 type waiter = { slot : Raw.slot; mutable busy : bool }
 
@@ -20,35 +21,37 @@ module Files = Map.Make (struct
   let compare = Stdlib.compare
 end)
 
-type t = {
+type 'a t = {
   port : Raw.port;
   skip_on_success : bool;
   lock : Mutex.t;
-  requests : (int, request) Hashtbl.t;
-  mutable files : association Files.t;
+  mutable next_id : int;
+  requests : (int, 'a request) Hashtbl.t;
+  mutable files : 'a association Files.t;
   mutable closed : bool;
   mutable waiters : waiter list;
 }
 
-and association = {
+and 'a association = {
   key : file_key;
-  port_state : t;
+  port_state : 'a t;
   mutable skip : bool option;
-  mutable handles : handle list;
+  mutable handles : 'a handle list;
 }
 
-and handle = {
-  association : association;
+and 'a handle = {
+  association : 'a association;
   fd : Unix.file_descr;
   mutable pending : int;
   mutable released : bool;
 }
 
-and request = {
+and 'a request = {
   operation : Raw.operation;
   id : int;
+  data : 'a;
   owner : Raw.port;
-  handle : handle;
+  handle : 'a handle;
   receive : bool;
   mutable eof_on_cancel : bool;
   mutable immediate : bool;
@@ -63,6 +66,7 @@ let create ?(skip_on_success = false) () =
     port = Raw.create_port ();
     files = Files.empty;
     lock = Mutex.create ();
+    next_id = 0;
     requests = Hashtbl.create 16;
     closed = false;
     waiters = [];
@@ -140,9 +144,6 @@ let cancel_all t =
       check t;
       Hashtbl.iter (fun _ r -> Raw.cancel_operation r.operation) t.requests)
 
-let notification =
-  Some { id = 0; bytes_transferred = 0; error = None; source = None }
-
 let check_timeout timeout =
   if timeout < -1 || Int64.of_int timeout > 0xffff_fffeL then
     invalid_arg "Iocp: invalid timeout"
@@ -175,21 +176,24 @@ let wait t ~timeout =
   | -1 -> None
   | 0 ->
       Raw.acknowledge slot;
-      notification
+      Some Wake
   | id ->
       locked t (fun () ->
           let r = Hashtbl.find t.requests id in
-          let result = Raw.completion r.operation r.eof_on_cancel in
+          let result = Some (Completion (r.data, Raw.completion r.operation r.eof_on_cancel)) in
           Hashtbl.remove t.requests id;
           r.handle.pending <- r.handle.pending - 1;
           Raw.acknowledge slot;
           result)
 
-let submit ?(receive = false) t ~id h roots fn =
+let submit ?(receive = false) t ~data h roots fn =
   locked t (fun () ->
       check_handle t h;
-      if id <= 0 || Hashtbl.mem t.requests id then
-        invalid_arg "Iocp: duplicate or non-positive request ID";
+      let rec fresh_id () =
+        t.next_id <- if t.next_id = max_int then 1 else t.next_id + 1;
+        if Hashtbl.mem t.requests t.next_id then fresh_id () else t.next_id
+      in
+      let id = fresh_id () in
       let skip =
         match h.association.skip with
         | Some skip -> skip
@@ -208,6 +212,7 @@ let submit ?(receive = false) t ~id h roots fn =
         {
           operation;
           id;
+          data;
           owner = t.port;
           handle = h;
           receive;
@@ -231,28 +236,28 @@ let submit ?(receive = false) t ~id h roots fn =
           Hashtbl.remove t.requests id;
           raise ex)
 
-let result r = if r.immediate then Raw.completion r.operation false else None
+let result r = if r.immediate then Some (Raw.completion r.operation false) else None
 
-let buffer kind t ~id fd buf ~offset =
+let buffer kind t ~data fd buf ~offset =
   if offset < 0L && not (kind = Raw.Write_file && offset = -1L) then
     invalid_arg "Iocp: negative offset";
   submit
     ~receive:(kind = Raw.Recv || kind = Raw.Recv_from)
-    t ~id fd buf
+    t ~data fd buf
     (fun op -> Raw.submit_buffer op kind buf offset)
 
-let read = buffer Raw.Read_file
-let write = buffer Raw.Write_file
-let recv t ~id fd buf = buffer Raw.Recv t ~id fd buf ~offset:0L
-let send t ~id fd buf = buffer Raw.Send t ~id fd buf ~offset:0L
-let recvfrom t ~id fd buf = buffer Raw.Recv_from t ~id fd buf ~offset:0L
-let sendto t ~id fd buf addr = buffer (Raw.Send_to addr) t ~id fd buf ~offset:0L
+let read t = buffer Raw.Read_file t
+let write t = buffer Raw.Write_file t
+let recv t ~data fd buf = buffer Raw.Recv t ~data fd buf ~offset:0L
+let send t ~data fd buf = buffer Raw.Send t ~data fd buf ~offset:0L
+let recvfrom t ~data fd buf = buffer Raw.Recv_from t ~data fd buf ~offset:0L
+let sendto t ~data fd buf addr = buffer (Raw.Send_to addr) t ~data fd buf ~offset:0L
 
-let accept t ~id fd ~client =
-  submit t ~id fd client (fun op -> Raw.submit_accept op client)
+let accept t ~data fd ~client =
+  submit t ~data fd client (fun op -> Raw.submit_accept op client)
 
-let connect t ~id fd addr =
-  submit t ~id fd addr (fun op -> Raw.submit_connect op addr)
+let connect t ~data fd addr =
+  submit t ~data fd addr (fun op -> Raw.submit_connect op addr)
 
 let openfile path flags perm =
   let has f = List.mem f flags in

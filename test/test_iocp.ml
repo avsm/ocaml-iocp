@@ -30,14 +30,17 @@ let close_port p =
 let associate p fd = ignore (handle p fd)
 let check = Alcotest.(check int)
 
-let status p =
+let delivery p =
   match Iocp.wait p ~timeout:10000 with
-  | Some x -> x
+  | Some (Iocp.Completion (data, c)) -> data, c
+  | Some Wake -> Alcotest.fail "unexpected wake"
   | None -> Alcotest.fail "completion timed out"
 
+let status p = snd (delivery p)
+
 let success p id bytes =
-  let c = status p in
-  check "id" id c.id;
+  let data, c = delivery p in
+  check "id" id data;
   check "bytes" bytes c.bytes_transferred;
   match c.error with
   | None -> ()
@@ -74,15 +77,15 @@ let file () =
   Fun.protect ~finally:(fun () -> close_fd fd) @@ fun () ->
   with_port @@ fun p ->
   ignore
-    (Iocp.write p ~id:1 (handle p fd) (Cstruct.of_string "hello") ~offset:8L);
+    (Iocp.write p ~data:1 (handle p fd) (Cstruct.of_string "hello") ~offset:8L);
   success p 1 5;
   let buf = Cstruct.create 5 in
-  ignore (Iocp.read p ~id:2 (handle p fd) buf ~offset:8L);
+  ignore (Iocp.read p ~data:2 (handle p fd) buf ~offset:8L);
   success p 2 5;
   Alcotest.(check string) "contents" "hello" (Cstruct.to_string buf);
   (* A truncated high offset would read the five bytes at offset 8. *)
   for id = 3 to 102 do
-    ignore (Iocp.read p ~id (handle p fd) buf ~offset:0x1_0000_0008L);
+    ignore (Iocp.read p ~data:id (handle p fd) buf ~offset:0x1_0000_0008L);
     success p id 0;
     assert (Iocp.wait p ~timeout:0 = None)
   done;
@@ -91,11 +94,11 @@ let file () =
 let pipe () =
   with_pipe @@ fun p r w ->
   let buf = Cstruct.create 5 in
-  ignore (Iocp.read p ~id:1 (handle p r) buf ~offset:0L);
+  ignore (Iocp.read p ~data:1 (handle p r) buf ~offset:0L);
   ignore
-    (Iocp.write p ~id:2 (handle p w) (Cstruct.of_string "hello") ~offset:0L);
-  let a = status p and b = status p in
-  check "id sum" 3 (a.id + b.id);
+    (Iocp.write p ~data:2 (handle p w) (Cstruct.of_string "hello") ~offset:0L);
+  let ia, a = delivery p and ib, b = delivery p in
+  check "id sum" 3 (ia + ib);
   check "read/write bytes" 10 (a.bytes_transferred + b.bytes_transferred);
   assert (a.error = None && b.error = None);
   Alcotest.(check string) "contents" "hello" (Cstruct.to_string buf)
@@ -103,13 +106,13 @@ let pipe () =
 let cancel_gc () =
   with_pipe @@ fun p r _w ->
   let request =
-    Iocp.read p ~id:1 (handle p r) (Cstruct.create 100) ~offset:0L
+    Iocp.read p ~data:1 (handle p r) (Cstruct.create 100) ~offset:0L
   in
   Gc.full_major ();
   Gc.compact ();
   Iocp.cancel p request;
-  let c = status p in
-  check "cancel id" 1 c.id;
+  let data, c = delivery p in
+  check "cancel id" 1 data;
   assert (c.error <> None);
   Iocp.cancel p request;
   check "drained" 0 (Iocp.pending p)
@@ -123,7 +126,7 @@ let completed_buffer () =
       let request =
         let buf = Cstruct.create 1 in
         Weak.set weak 0 (Some buf);
-        Iocp.write p ~id:1 h buf ~offset:0L
+        Iocp.write p ~data:1 h buf ~offset:0L
       in
       let c = match Iocp.result request with Some c -> c | None -> status p in
       assert (c.error = None);
@@ -135,17 +138,17 @@ let completed_buffer () =
 
 let lifetime () =
   with_pipe @@ fun p r _w ->
-  ignore (Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L);
+  ignore (Iocp.read p ~data:1 (handle p r) (Cstruct.create 1) ~offset:0L);
   invalid (fun () -> Iocp.close p);
+  ignore (Iocp.read p ~data:1 (handle p r) (Cstruct.create 1) ~offset:0L);
+  check "same payload, distinct requests" 2 (Iocp.pending p);
   invalid (fun () ->
-      ignore (Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L));
-  invalid (fun () ->
-      ignore (Iocp.read p ~id:2 (handle p r) (Cstruct.create 1) ~offset:(-2L)))
+      ignore (Iocp.read p ~data:2 (handle p r) (Cstruct.create 1) ~offset:(-2L)))
 
 let submission_failure () =
   with_pipe @@ fun p _r w ->
   for _ = 1 to 1100 do
-    match Iocp.read p ~id:1 (handle p w) (Cstruct.create 1) ~offset:0L with
+    match Iocp.read p ~data:1 (handle p w) (Cstruct.create 1) ~offset:0L with
     | _ -> Alcotest.fail "read on write-only pipe succeeded"
     | exception Unix.Unix_error _ -> check "rolled back" 0 (Iocp.pending p)
   done
@@ -153,7 +156,7 @@ let submission_failure () =
 let many_requests () =
   with_pipe @@ fun p r _w ->
   for id = 1 to 1100 do
-    ignore (Iocp.read p ~id (handle p r) (Cstruct.create 1) ~offset:0L)
+    ignore (Iocp.read p ~data:id (handle p r) (Cstruct.create 1) ~offset:0L)
   done;
   Gc.full_major ();
   check "pending" 1100 (Iocp.pending p);
@@ -167,7 +170,7 @@ let wake () =
   with_port @@ fun p ->
   assert (Iocp.wait p ~timeout:0 = None);
   let d = Domain.spawn (fun () -> Iocp.wake p) in
-  success p 0 0;
+  assert (Iocp.wait p ~timeout:10000 = Some Wake);
   Domain.join d
 
 let sockets () =
@@ -181,16 +184,16 @@ let sockets () =
   Unix.listen listener 1;
   Unix.bind client (ADDR_INET (Unix.inet_addr_any, 0));
   with_port @@ fun p ->
-  ignore (Iocp.accept p ~id:1 (handle p listener) ~client:accepted);
-  ignore (Iocp.connect p ~id:2 (handle p client) (Unix.getsockname listener));
-  let a = status p and b = status p in
-  check "ids" 3 (a.id + b.id);
+  ignore (Iocp.accept p ~data:1 (handle p listener) ~client:accepted);
+  ignore (Iocp.connect p ~data:2 (handle p client) (Unix.getsockname listener));
+  let ia, a = delivery p and ib, b = delivery p in
+  check "ids" 3 (ia + ib);
   assert (a.error = None && b.error = None);
   assert (Unix.getpeername client = Unix.getsockname listener);
   ignore (Unix.getpeername accepted);
   let buf = Cstruct.create 5 in
-  ignore (Iocp.recv p ~id:3 (handle p accepted) buf);
-  ignore (Iocp.send p ~id:4 (handle p client) (Cstruct.of_string "hello"));
+  ignore (Iocp.recv p ~data:3 (handle p accepted) buf);
+  ignore (Iocp.send p ~data:4 (handle p client) (Cstruct.of_string "hello"));
   let a = status p and b = status p in
   assert (a.error = None && b.error = None);
   check "bytes" 10 (a.bytes_transferred + b.bytes_transferred);
@@ -206,7 +209,7 @@ let refused () =
   Unix.bind reserved (ADDR_INET (Unix.inet_addr_loopback, 0));
   Unix.bind client (ADDR_INET (Unix.inet_addr_any, 0));
   with_port @@ fun p ->
-  match Iocp.connect p ~id:1 (handle p client) (Unix.getsockname reserved) with
+  match Iocp.connect p ~data:1 (handle p client) (Unix.getsockname reserved) with
   | _ ->
       let c = status p in
       if c.error <> Some Unix.ECONNREFUSED then
@@ -228,27 +231,27 @@ let receive_shutdown ~duplicate () =
       close_fd other_b)
   @@ fun () ->
   with_port @@ fun p ->
-  ignore (Iocp.recv p ~id:1 (handle p a) (Cstruct.create 1));
-  let other = Iocp.recv p ~id:2 (handle p other_a) (Cstruct.create 1) in
+  ignore (Iocp.recv p ~data:1 (handle p a) (Cstruct.create 1));
+  let other = Iocp.recv p ~data:2 (handle p other_a) (Cstruct.create 1) in
   if duplicate then
     let alias = Unix.dup ~cloexec:true a in
     Fun.protect
       ~finally:(fun () -> close_fd alias)
       (fun () -> Iocp.shutdown p (handle p alias) Unix.SHUTDOWN_RECEIVE)
   else Iocp.shutdown p (handle p a) Unix.SHUTDOWN_RECEIVE;
-  let c = status p in
+  let data, c = delivery p in
   (match c.error with
   | None -> ()
   | Some e ->
       Alcotest.fail
         (Printexc.to_string (Unix.Unix_error (e, "shutdown read", ""))));
-  check "shutdown request" 1 c.id;
+  check "shutdown request" 1 data;
   check "EOF" 0 c.bytes_transferred;
   assert (Iocp.wait p ~timeout:0 = None);
   check "unrelated receive remains pending" 1 (Iocp.pending p);
   Iocp.cancel p other;
-  let c = status p in
-  check "unrelated request" 2 c.id;
+  let data, c = delivery p in
+  check "unrelated request" 2 data;
   assert (c.error <> None)
 
 let shutdown_preserves_error () =
@@ -264,7 +267,7 @@ let shutdown_preserves_error () =
       @@ fun () ->
       Unix.bind r (ADDR_INET (Unix.inet_addr_loopback, 0));
       Unix.bind w (ADDR_INET (Unix.inet_addr_loopback, 0));
-      ignore (Iocp.recvfrom p ~id:1 (handle p r) (Cstruct.create 1));
+      ignore (Iocp.recvfrom p ~data:1 (handle p r) (Cstruct.create 1));
       let addr = Unix.getsockname r in
       ignore (Unix.sendto w (Bytes.make 1024 'x') 0 1024 [] addr);
       ignore (Unix.sendto w (Bytes.of_string "done") 0 4 [] addr);
@@ -295,10 +298,7 @@ let retry_delivery () =
   ignore (Raw.submit_buffer op Raw.Write_file buf 0L);
   check "first delivery" 1 (Raw.dequeue p slot 10000);
   let first = Raw.completion op false in
-  assert (
-    match first with
-    | Some c -> c.id = 1 && c.bytes_transferred = 1 && c.error = None
-    | None -> false);
+  assert (first.bytes_transferred = 1 && first.error = None);
   Raw.wake_port p;
   Gc.compact ();
   check "retry the same packet" 1 (Raw.dequeue p slot 0);
@@ -336,9 +336,9 @@ let consumer_handover () =
 
 let concurrent_delivery () =
   with_pipe @@ fun p r w ->
-  let readers = Array.init 2 (fun _ -> Domain.spawn (fun () -> (status p).id)) in
-  ignore (Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L);
-  ignore (Iocp.write p ~id:2 (handle p w) (Cstruct.of_string "x") ~offset:0L);
+  let readers = Array.init 2 (fun _ -> Domain.spawn (fun () -> fst (delivery p))) in
+  ignore (Iocp.read p ~data:1 (handle p r) (Cstruct.create 1) ~offset:0L);
+  ignore (Iocp.write p ~data:2 (handle p w) (Cstruct.of_string "x") ~offset:0L);
   assert (Array.to_list (Array.map Domain.join readers) |> List.sort compare = [1; 2])
 
 let concurrent_wait () =
@@ -367,42 +367,42 @@ let concurrent_wait () =
   Iocp.Interrupt.signal first;
   assert (Domain.join workers.(0) = None);
   Iocp.wake p;
-  assert ((Option.get (Domain.join workers.(1))).id = 0);
+  assert (Domain.join workers.(1) = Some Iocp.Wake);
   Iocp.Interrupt.signal first
 
 let cancel_race () =
   with_pipe @@ fun p r w ->
   for n = 1 to 100 do
     let read =
-      Iocp.read p ~id:(2 * n) (handle p r) (Cstruct.create 1) ~offset:0L
+      Iocp.read p ~data:(2 * n) (handle p r) (Cstruct.create 1) ~offset:0L
     in
     ignore
       (Iocp.write p
-         ~id:((2 * n) + 1)
+         ~data:((2 * n) + 1)
          (handle p w) (Cstruct.of_string "x") ~offset:0L);
     Iocp.cancel p read;
-    let a = status p and b = status p in
-    check "two distinct completions" ((4 * n) + 1) (a.id + b.id);
-    assert (a.id <> b.id);
+    let ia, _ = delivery p and ib, _ = delivery p in
+    check "two distinct completions" ((4 * n) + 1) (ia + ib);
+    assert (ia <> ib);
     check "drained" 0 (Iocp.pending p)
   done
 
 let cross_domain_submit () =
   with_pipe @@ fun p r w ->
   let buf = Cstruct.create 5 in
-  ignore (Iocp.read p ~id:1 (handle p r) buf ~offset:0L);
+  ignore (Iocp.read p ~data:1 (handle p r) buf ~offset:0L);
   let writer =
     Domain.spawn (fun () ->
         ignore
-          (Iocp.write p ~id:2 (handle p w)
+          (Iocp.write p ~data:2 (handle p w)
              (Cstruct.of_string "hello")
              ~offset:0L))
   in
   Domain.join writer;
   Gc.full_major ();
-  let a = status p and b = status p in
+  let ia, a = delivery p and ib, b = delivery p in
   assert (a.error = None && b.error = None);
-  check "ids" 3 (a.id + b.id);
+  check "ids" 3 (ia + ib);
   Alcotest.(check string) "contents" "hello" (Cstruct.to_string buf)
 
 let closed_port () =
@@ -415,7 +415,7 @@ let closed_port () =
 let wrong_port () =
   with_pipe @@ fun p r _ ->
   with_port @@ fun other ->
-  let request = Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L in
+  let request = Iocp.read p ~data:1 (handle p r) (Cstruct.create 1) ~offset:0L in
   invalid (fun () -> Iocp.cancel other request)
 
 let cancel_accept () =
@@ -428,11 +428,11 @@ let cancel_accept () =
   Unix.bind listener (ADDR_INET (Unix.inet_addr_loopback, 0));
   Unix.listen listener 1;
   with_port @@ fun p ->
-  let r = Iocp.accept p ~id:1 (handle p listener) ~client in
+  let r = Iocp.accept p ~data:1 (handle p listener) ~client in
   Gc.full_major ();
   Iocp.cancel p r;
-  let c = status p in
-  check "cancelled accept ID" 1 c.id;
+  let data, c = delivery p in
+  check "cancelled accept ID" 1 data;
   assert (c.error <> None)
 
 let append_access () =
@@ -442,7 +442,7 @@ let append_access () =
   Fun.protect ~finally:(fun () -> close_fd fd) @@ fun () ->
   with_port @@ fun p ->
   match
-    Iocp.write p ~id:1 (handle p fd) (Cstruct.of_string "x") ~offset:(-1L)
+    Iocp.write p ~data:1 (handle p fd) (Cstruct.of_string "x") ~offset:(-1L)
   with
   | _ -> Alcotest.fail "append granted write access to a read-only handle"
   | exception Unix.Unix_error _ -> check "rollback" 0 (Iocp.pending p)
@@ -457,20 +457,20 @@ let datagrams () =
   Unix.bind a (ADDR_INET (Unix.inet_addr_loopback, 0));
   Unix.bind b (ADDR_INET (Unix.inet_addr_loopback, 0));
   with_port @@ fun p ->
-  let cancelled = Iocp.recvfrom p ~id:1 (handle p a) (Cstruct.create 5) in
+  let cancelled = Iocp.recvfrom p ~data:1 (handle p a) (Cstruct.create 5) in
   Gc.full_major ();
   Iocp.cancel p cancelled;
   assert ((status p).error <> None);
   List.iter
     (fun msg ->
       let buf = Cstruct.create 5 in
-      ignore (Iocp.recvfrom p ~id:2 (handle p a) buf);
+      ignore (Iocp.recvfrom p ~data:2 (handle p a) buf);
       ignore
-        (Iocp.sendto p ~id:3 (handle p b) (Cstruct.of_string msg)
+        (Iocp.sendto p ~data:3 (handle p b) (Cstruct.of_string msg)
            (Unix.getsockname a));
-      let x = status p and y = status p in
+      let id, x = delivery p and y = status p in
       assert (x.error = None && y.error = None);
-      let received = if x.id = 2 then x else y in
+      let received = if id = 2 then x else y in
       check "datagram length" (String.length msg) received.bytes_transferred;
       assert (received.source = Some (Unix.getsockname b));
       Alcotest.(check string)
@@ -488,7 +488,7 @@ let buffered_truncation () =
       with_port ~skip_on_success @@ fun p ->
       ignore (Unix.sendto w (Bytes.of_string "abc") 0 3 [] (Unix.getsockname r));
       let buf = Cstruct.create 1 in
-      let req = Iocp.recvfrom p ~id:1 (handle p r) buf in
+      let req = Iocp.recvfrom p ~data:1 (handle p r) buf in
       let c = match Iocp.result req with Some c -> c | None -> status p in
       assert (c.error = Some Unix.EMSGSIZE);
       assert (c.source = Some (Unix.getsockname w));
@@ -499,13 +499,13 @@ let buffered_truncation () =
 let cancel_write () =
   with_pipe @@ fun p _r w ->
   let r =
-    Iocp.write p ~id:1 (handle p w) (Cstruct.create (1024 * 1024)) ~offset:0L
+    Iocp.write p ~data:1 (handle p w) (Cstruct.create (1024 * 1024)) ~offset:0L
   in
   assert (Iocp.wait p ~timeout:0 = None);
   Gc.full_major ();
   Iocp.cancel p r;
-  let c = status p in
-  check "write cancellation ID" 1 c.id;
+  let data, c = delivery p in
+  check "write cancellation ID" 1 data;
   assert (c.error <> None);
   check "write drained" 0 (Iocp.pending p)
 
@@ -513,11 +513,11 @@ let pipe_eof () =
   let r, w = Iocp.pipe () in
   Fun.protect ~finally:(fun () -> close_fd r) @@ fun () ->
   with_port @@ fun p ->
-  ignore (Iocp.read p ~id:1 (handle p r) (Cstruct.create 1) ~offset:0L);
+  ignore (Iocp.read p ~data:1 (handle p r) (Cstruct.create 1) ~offset:0L);
   close_fd w;
   success p 1 0;
   for id = 2 to 20 do
-    ignore (Iocp.read p ~id (handle p r) (Cstruct.create 1) ~offset:0L);
+    ignore (Iocp.read p ~data:id (handle p r) (Cstruct.create 1) ~offset:0L);
     success p id 0;
     assert (Iocp.wait p ~timeout:0 = None)
   done
@@ -570,9 +570,9 @@ let immediate () =
     check "one byte" 1 c.bytes_transferred
   in
   for _ = 1 to 100 do
-    finish (Iocp.write p ~id:1 (handle p w) (Cstruct.of_string "x") ~offset:0L);
+    finish (Iocp.write p ~data:1 (handle p w) (Cstruct.of_string "x") ~offset:0L);
     let buf = Cstruct.create 1 in
-    finish (Iocp.read p ~id:2 (handle p r) buf ~offset:0L);
+    finish (Iocp.read p ~data:2 (handle p r) buf ~offset:0L);
     Alcotest.(check string) "pipe contents" "x" (Cstruct.to_string buf);
     check "drained" 0 (Iocp.pending p);
     assert (Iocp.wait p ~timeout:0 = None)
@@ -583,7 +583,7 @@ let immediate () =
   Fun.protect ~finally:(fun () -> close_fd eof) @@ fun () ->
   for _ = 1 to 20 do
     let request =
-      Iocp.read p ~id:3 (handle p eof) (Cstruct.create 1) ~offset:0L
+      Iocp.read p ~data:3 (handle p eof) (Cstruct.create 1) ~offset:0L
     in
     let c = match Iocp.result request with Some c -> c | None -> status p in
     assert (c.error = None);
@@ -602,7 +602,7 @@ let open_flags () =
   with_port @@ fun p ->
   with_file [ O_WRONLY; O_CREAT; O_EXCL ] (fun fd ->
       ignore
-        (Iocp.write p ~id:1 (handle p fd) (Cstruct.of_string "abc") ~offset:0L);
+        (Iocp.write p ~data:1 (handle p fd) (Cstruct.of_string "abc") ~offset:0L);
       success p 1 3);
   (match Iocp.openfile path [ O_WRONLY; O_CREAT; O_EXCL ] 0o600 with
   | fd ->
@@ -611,11 +611,11 @@ let open_flags () =
   | exception Unix.Unix_error (EEXIST, _, _) -> ());
   with_file [ O_WRONLY; O_APPEND ] (fun fd ->
       ignore
-        (Iocp.write p ~id:2 (handle p fd) (Cstruct.of_string "d") ~offset:0L);
+        (Iocp.write p ~data:2 (handle p fd) (Cstruct.of_string "d") ~offset:0L);
       success p 2 1);
   with_file [ O_RDONLY ] (fun fd ->
       let buf = Cstruct.create 4 in
-      ignore (Iocp.read p ~id:3 (handle p fd) buf ~offset:0L);
+      ignore (Iocp.read p ~data:3 (handle p fd) buf ~offset:0L);
       success p 3 4;
       Alcotest.(check string)
         "append cannot overwrite" "abcd" (Cstruct.to_string buf));
@@ -676,13 +676,13 @@ let creation_permissions () =
         with_port (fun p ->
             if mode = Unix.O_RDONLY then (
               ignore
-                (Iocp.read p ~id:1 (handle p fd) (Cstruct.create 1) ~offset:0L);
+                (Iocp.read p ~data:1 (handle p fd) (Cstruct.create 1) ~offset:0L);
               success p 1 0)
             else (
               check "Unix creation handle remains writable" 1
                 (Unix.write_substring reference_fd "x" 0 1);
               ignore
-                (Iocp.write p ~id:1 (handle p fd) (Cstruct.of_string "x")
+                (Iocp.write p ~data:1 (handle p fd) (Cstruct.of_string "x")
                    ~offset:0L);
               success p 1 1))
   in
@@ -716,8 +716,8 @@ let replaced_descriptor () =
           close_port p)
       @@ fun () ->
       associate p target;
-      let finish r =
-        match Iocp.result r with Some c -> c | None -> status p
+      let finish data r =
+        match Iocp.result r with Some c -> data, c | None -> delivery p
       in
       for n = 1 to 100 do
         let source, writer = Iocp.pipe () in
@@ -730,15 +730,15 @@ let replaced_descriptor () =
         Unix.dup2 source target;
         if n mod 10 = 0 then Gc.compact ();
         let buf = Cstruct.create 1 in
-        let read = Iocp.read p ~id:(2 * n) (handle p target) buf ~offset:0L in
+        let read = Iocp.read p ~data:(2 * n) (handle p target) buf ~offset:0L in
         let write =
           Iocp.write p
-            ~id:((2 * n) + 1)
+            ~data:((2 * n) + 1)
             (handle p writer) (Cstruct.of_string "x") ~offset:0L
         in
-        let a = finish read and b = finish write in
+        let ia, a = finish (2 * n) read and ib, b = finish (2 * n + 1) write in
         assert (a.error = None && b.error = None);
-        check "both completions" ((4 * n) + 1) (a.id + b.id);
+        check "both completions" ((4 * n) + 1) (ia + ib);
         Alcotest.(check string)
           "replacement contents" "x" (Cstruct.to_string buf);
         check "drained" 0 (Iocp.pending p)
@@ -756,6 +756,23 @@ let failed_registration () =
   | _ -> Alcotest.fail "registered a synchronous pipe for overlapped I/O"
   | exception Unix.Unix_error _ -> ());
   Iocp.close_handle (Iocp.register p writer)
+
+let typed_payload () =
+  let p = Iocp.create () in
+  Fun.protect ~finally:(fun () -> Iocp.close p) @@ fun () ->
+  let r, w = Iocp.pipe () in
+  Fun.protect ~finally:(fun () -> Unix.close r; Unix.close w) @@ fun () ->
+  let h = Iocp.register p w in
+  Fun.protect ~finally:(fun () -> Iocp.close_handle h) @@ fun () ->
+  let token = ref "done" in
+  for _ = 1 to 2 do
+    ignore (Iocp.write p ~data:token h (Cstruct.of_string "x") ~offset:0L)
+  done;
+  Gc.compact ();
+  for _ = 1 to 2 do
+    let returned, c = delivery p in
+    assert (returned == token && c.bytes_transferred = 1 && c.error = None)
+  done
 
 let association_ownership () =
   with_pipe @@ fun p r _w ->
@@ -782,27 +799,27 @@ let registered_aliases ~skip_on_success () =
   assert (Iocp.file_key original == Iocp.file_key duplicate);
   assert (Iocp.file_key original != Iocp.file_key writer);
   let buf = Cstruct.create 1 in
-  let read = Iocp.read p ~id:1 duplicate buf ~offset:0L in
+  let read = Iocp.read p ~data:1 duplicate buf ~offset:0L in
   invalid (fun () -> Iocp.close_handle duplicate);
   Iocp.close_handle original;
-  invalid (fun () -> ignore (Iocp.read p ~id:3 original buf ~offset:0L));
-  let write = Iocp.write p ~id:2 writer (Cstruct.of_string "x") ~offset:0L in
-  let finish r = match Iocp.result r with Some c -> c | None -> status p in
-  let a = finish read and b = finish write in
+  invalid (fun () -> ignore (Iocp.read p ~data:3 original buf ~offset:0L));
+  let write = Iocp.write p ~data:2 writer (Cstruct.of_string "x") ~offset:0L in
+  let finish data r = match Iocp.result r with Some c -> data, c | None -> delivery p in
+  let ia, a = finish 1 read and ib, b = finish 2 write in
   assert (a.error = None && b.error = None);
-  check "both completions" 3 (a.id + b.id);
+  check "both completions" 3 (ia + ib);
   Alcotest.(check string) "alias contents" "x" (Cstruct.to_string buf)
 
 let registered_pending () =
   with_pipe @@ fun p r w ->
   with_registration p r @@ fun reader ->
   with_registration p w @@ fun writer ->
-  ignore (Iocp.read p ~id:1 reader (Cstruct.create 1) ~offset:0L);
-  let pending = Iocp.read p ~id:2 reader (Cstruct.create 1) ~offset:0L in
-  ignore (Iocp.write p ~id:3 writer (Cstruct.of_string "x") ~offset:0L);
-  let a = status p and b = status p in
+  ignore (Iocp.read p ~data:1 reader (Cstruct.create 1) ~offset:0L);
+  let pending = Iocp.read p ~data:2 reader (Cstruct.create 1) ~offset:0L in
+  ignore (Iocp.write p ~data:3 writer (Cstruct.of_string "x") ~offset:0L);
+  let ia, a = delivery p and ib, b = delivery p in
   assert (a.error = None && b.error = None);
-  check "first read and write" 4 (a.id + b.id);
+  check "first read and write" 4 (ia + ib);
   invalid (fun () -> Iocp.close_handle reader);
   Iocp.cancel p pending;
   assert ((status p).error <> None);
@@ -827,9 +844,9 @@ let registration_reuse () =
         assert (c.error = None);
         check "one byte" 1 c.bytes_transferred
       in
-      finish (Iocp.write p ~id:1 writer (Cstruct.of_string "x") ~offset:0L);
+      finish (Iocp.write p ~data:1 writer (Cstruct.of_string "x") ~offset:0L);
       let buf = Cstruct.create 1 in
-      finish (Iocp.read p ~id:2 reader buf ~offset:0L);
+      finish (Iocp.read p ~data:2 reader buf ~offset:0L);
       Alcotest.(check string)
         "re-registered contents" "x" (Cstruct.to_string buf);
       assert (Iocp.wait p ~timeout:0 = None))
@@ -878,6 +895,7 @@ let () =
             ("cancellation race", cancel_race);
             ("cross-domain submission", cross_domain_submit);
             ("closed port", closed_port);
+            ("typed completion payload", typed_payload);
             ("wrong-port cancellation", wrong_port);
             ("concurrent completion delivery", concurrent_delivery);
             ("targeted concurrent wait", concurrent_wait);
