@@ -139,12 +139,9 @@ let close_handle h =
         in
         if not (Atomic.compare_and_set h.pending 0 (-1)) then
           invalid_arg "Iocp.close_handle: handle is busy";
-        (try if remaining = [] then Raw.detach h.fd
-         with ex ->
-           Atomic.set h.pending 0;
-           raise ex);
         t.files <- files;
-        a.handles <- remaining))
+        a.handles <- remaining;
+        if remaining = [] then Raw.detach h.fd))
 
 (* A submission on another port can race with closing this registration. *)
 let rec acquire h =

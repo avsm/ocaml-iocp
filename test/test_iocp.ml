@@ -866,6 +866,17 @@ let registration_reuse () =
       assert (Iocp.wait p ~timeout:0 = None))
     [ true; false; true; false ]
 
+let detach_failure () =
+  let module P = Fault_iocp in
+  let rd, wr = P.pipe () in
+  Fun.protect ~finally:(fun () -> Unix.close rd; Unix.close wr) @@ fun () ->
+  let p = P.create () in
+  let h = P.register p rd in
+  Alcotest.check_raises "native detach failed" (Unix.Unix_error (EIO, "detach", ""))
+    (fun () -> P.close_handle h);
+  P.close_handle h;
+  P.close p
+
 let foreign_alias_reuse () =
   with_pipe @@ fun p target _ ->
   with_pipe @@ fun q source _ ->
@@ -892,6 +903,7 @@ let () =
             ("replaced descriptor", replaced_descriptor);
             ("association ownership", association_ownership);
             ("failed registration", failed_registration);
+            ("failed native detachment", detach_failure);
             ("cross-port completion and cancellation", routed_pipe);
             ("registered aliases", registered_aliases ~skip_on_success:false);
             ( "registered aliases with immediate completion",

@@ -1,8 +1,15 @@
 (copy_files ../src/raw.ml)
 
+(rule
+ (action
+  (with-stdout-to fault_iocp.ml
+  (progn
+   (echo "module Raw = struct include Raw let detach _ = raise (Unix.Unix_error (Unix.EIO, \"detach\", \"\")) end\n")
+   (cat ../src/iocp.ml)))))
+
 (test
  (name test_iocp)
- (modules test_iocp raw)
+ (modules test_iocp raw fault_iocp)
  (modes byte byte_complete exe)
  (libraries iocp alcotest)
  (enabled_if (= %{os_type} "Win32")))

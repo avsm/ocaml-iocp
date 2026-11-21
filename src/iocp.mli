@@ -122,7 +122,9 @@ val close_handle : 'a handle -> unit
     [Invalid_argument] while its requests remain pending. Closing the last
     registration detaches the object from the port, allowing later registration
     with another port. The original descriptor remains open and belongs to the
-    caller. *)
+    caller. If native detachment fails, [Unix.Unix_error] is raised and the
+    registration is still closed. The object may remain associated with the
+    old port until its descriptors are closed. *)
 
 val wake : 'a t -> unit
 (** Queue a [Wake] notification. This function may be called from another thread or domain. *)
