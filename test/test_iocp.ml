@@ -341,6 +341,35 @@ let concurrent_delivery () =
   ignore (Iocp.write p ~id:2 (handle p w) (Cstruct.of_string "x") ~offset:0L);
   assert (Array.to_list (Array.map Domain.join readers) |> List.sort compare = [1; 2])
 
+let concurrent_wait () =
+  with_port @@ fun p ->
+  let targets = Array.init 2 (fun _ -> Atomic.make None) in
+  let workers =
+    Array.map
+      (fun target ->
+        Domain.spawn (fun () ->
+            let interrupt = Iocp.Interrupt.current () in
+            Fun.protect ~finally:(fun () -> Iocp.Interrupt.close interrupt)
+            @@ fun () ->
+            Atomic.set target (Some interrupt);
+            Iocp.wait p ~timeout:10000))
+      targets
+  in
+  let rec get target =
+    match Atomic.get target with
+    | Some t -> t
+    | None ->
+        Domain.cpu_relax ();
+        get target
+  in
+  let first = get targets.(0) in
+  ignore (get targets.(1));
+  Iocp.Interrupt.signal first;
+  assert (Domain.join workers.(0) = None);
+  Iocp.wake p;
+  assert ((Option.get (Domain.join workers.(1))).id = 0);
+  Iocp.Interrupt.signal first
+
 let cancel_race () =
   with_pipe @@ fun p r w ->
   for n = 1 to 100 do
@@ -847,6 +876,7 @@ let () =
             ("closed port", closed_port);
             ("wrong-port cancellation", wrong_port);
             ("concurrent completion delivery", concurrent_delivery);
+            ("targeted concurrent wait", concurrent_wait);
             ("sequential consumer handover", consumer_handover);
             ("retry unacknowledged delivery", retry_delivery);
             ("shutdown preserves queued errors", shutdown_preserves_error);

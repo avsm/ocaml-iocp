@@ -34,6 +34,8 @@ external dequeue : port -> slot -> int -> int = "iocp_dequeue"
 
 let acknowledge slot = slot.{0} <- -1
 
+external current_thread : unit -> Unix.file_descr = "iocp_current_thread"
+external interrupt : Unix.file_descr -> unit = "iocp_interrupt"
 external completion : operation -> bool -> completion option = "iocp_completion"
 
 type delivery = Native_queue | Post_queue | Immediate
