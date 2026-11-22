@@ -11,21 +11,26 @@ There is no fixed limit on the number of outstanding requests.
 ## Ownership
 
 - Multiple threads may submit, cancel and consume completions on a port.
-- Call `Iocp.register port fd` before submitting I/O. The returned handle borrows
-  the descriptor; keep it open and unchanged until `Iocp.close_handle` returns.
+- `Iocp.Event` accepts an overlapped descriptor directly. Each request uses its
+  own event and preserves the descriptor's completion-port settings. Keep the
+  descriptor open and unchanged until the request's completion is consumed.
+- For a persistent association, call `Iocp.register port fd` and keep the
+  descriptor open and unchanged until `Iocp.close_handle` returns.
 - Aliases can register with the same port. Registering an alias with another port
   fails while any registration remains open. Closing the last registration
   detaches the object, allowing it to be registered again later.
 - Submit a registered handle on the port where its consumer waits. When the
   ports differ, Windows delivers the operation to the submitting port, even
   after the thread that registered the handle exits.
-- Descriptors must support overlapped I/O. Do not change their completion
-  notification modes or issue overlapped I/O outside this library.
+- Registered descriptors must support overlapped I/O. Keep their notification
+  modes unchanged and submit overlapped I/O through this library.
 - Cancellation requests completion; it does not release the request's buffers.
 - Drain completions before closing registrations, then close the port. Both
   operations reject resources that are still busy.
 - Use `Iocp.shutdown` for local socket receive shutdown: Windows does not reliably
   complete an outstanding receive when `Unix.shutdown` is used directly.
+  For event-based receives, call `Unix.shutdown` and then
+  `Iocp.Event.cancel_receives` on each submitting port.
 - Explicit cleanup is required. Abandoning a pending request retains its resources
   rather than allowing Windows to access memory reclaimed by the GC.
 

@@ -3,8 +3,8 @@
 
 (** Windows I/O completion ports.
 
-    A port delivers completions for operations on registered files, pipes and
-    sockets. Threads and domains may submit and cancel requests concurrently.
+    A port delivers completions for registered handles and for individual
+    requests on borrowed descriptors (see {!Event}). Threads and domains may submit and cancel requests concurrently.
     Several threads may wait on the same port. Each queued packet is delivered
     once.
 
@@ -203,6 +203,36 @@ val shutdown : 'a t -> 'a handle -> Unix.shutdown_command -> unit
     receive that already completed keeps its data or error. If a duplicated
     socket lacks its connection context, shutdown tries its other live
     registrations for the same kernel object. *)
+
+(** Per-request event delivery. These operations have the same arguments and
+    results as the registered operations, but borrow an overlapped descriptor
+    directly. Keep it open and unchanged until delivery, including after
+    cancellation. Its completion-port association and notification modes are
+    preserved. A pending operation signals a private event that delivers its
+    completion to the submitting port. *)
+module Event : sig
+  val read : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> offset:int64 -> 'a request
+
+  val write : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> offset:int64 -> 'a request
+
+  val recv : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> 'a request
+
+  val send : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> 'a request
+
+  val recvfrom : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> 'a request
+
+  val sendto : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> Unix.sockaddr -> 'a request
+
+  val accept : 'a t -> data:'a -> Unix.file_descr -> client:Unix.file_descr -> 'a request
+
+  val connect : 'a t -> data:'a -> Unix.file_descr -> Unix.sockaddr -> 'a request
+
+  val cancel_receives : 'a t -> Unix.file_descr -> unit
+  (** After shutting down receive on a socket, call this on each port that
+      submitted event-based receives on it. This also covers duplicates.
+      Aborted receives complete as end of input. Completed transfers and
+      errors keep their results. *)
+end
 
 (** {1 Descriptor constructors} *)
 

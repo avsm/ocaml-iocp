@@ -256,7 +256,7 @@ let receive_shutdown ~duplicate () =
   check "unrelated request" 2 data;
   assert (c.error <> None)
 
-let shutdown_preserves_error () =
+let shutdown_preserves_error ~event () =
   List.iter
     (fun skip_on_success ->
       let p = Iocp.create ~skip_on_success () in
@@ -269,14 +269,21 @@ let shutdown_preserves_error () =
       @@ fun () ->
       Unix.bind r (ADDR_INET (Unix.inet_addr_loopback, 0));
       Unix.bind w (ADDR_INET (Unix.inet_addr_loopback, 0));
-      ignore (Iocp.recvfrom p ~data:1 (handle p r) (Cstruct.create 1));
+      let req =
+        if event then Iocp.Event.recvfrom p ~data:1 r (Cstruct.create 1)
+        else Iocp.recvfrom p ~data:1 (handle p r) (Cstruct.create 1)
+      in
+      assert (Iocp.result req = None);
       let addr = Unix.getsockname r in
       ignore (Unix.sendto w (Bytes.make 1024 'x') 0 1024 [] addr);
       ignore (Unix.sendto w (Bytes.of_string "done") 0 4 [] addr);
       let marker = Bytes.create 4 in
       check "marker length" 4 (fst (Unix.recvfrom r marker 0 4 []));
       Alcotest.(check string) "marker" "done" (Bytes.to_string marker);
-      Iocp.shutdown p (handle p r) Unix.SHUTDOWN_RECEIVE;
+      (if event then (
+         Unix.shutdown r Unix.SHUTDOWN_RECEIVE;
+         Iocp.Event.cancel_receives p r)
+       else Iocp.shutdown p (handle p r) Unix.SHUTDOWN_RECEIVE);
       let c = status p in
       assert (c.error = Some Unix.EMSGSIZE);
       check "partial receive" 1 c.bytes_transferred;
@@ -907,6 +914,61 @@ let foreign_alias_reuse () =
       Alcotest.fail "accepted a foreign alias"
   | exception Unix.Unix_error (EINVAL, _, _) -> ()
 
+let event_pipe ~skip_on_success () =
+  with_pipe ~skip_on_success @@ fun p r w ->
+  with_port @@ fun foreign ->
+  let buf = Cstruct.create 1 in
+  let read () = Iocp.Event.read p ~data:1 r buf ~offset:0L in
+  let consume req =
+    let c = match Iocp.result req with Some c -> c | None -> status p in
+    assert (c.error = None && c.bytes_transferred = 1)
+  in
+  let write () =
+    consume (Iocp.Event.write p ~data:2 w (Cstruct.of_string "x") ~offset:0L)
+  in
+  write ();
+  consume (read ());
+  (* The first transfer left both descriptors available for association. *)
+  with_registration foreign r @@ fun _ ->
+  with_registration foreign w @@ fun _ ->
+  let req = read () in
+  assert (Iocp.result req = None);
+  (* Consume the write on a separate port so queued packets can arrive in either order. *)
+  with_port ~skip_on_success:true @@ fun writer ->
+  let sent = Iocp.Event.write writer ~data:2 w (Cstruct.of_string "z") ~offset:0L in
+  let c = match Iocp.result sent with Some c -> c | None -> status writer in
+  assert (c.error = None && c.bytes_transferred = 1);
+  consume req;
+  assert (Cstruct.to_string buf = "z");
+  let req = read () in
+  Iocp.cancel p req;
+  assert ((status p).error <> None);
+  assert (Iocp.wait p ~timeout:0 = None);
+  assert (Iocp.wait foreign ~timeout:0 = None)
+
+let event_during_fstat () =
+  with_pipe ~skip_on_success:true @@ fun p r w ->
+  let alias = Unix.dup ~cloexec:true r in
+  Fun.protect ~finally:(fun () -> Unix.close alias) @@ fun () ->
+  let ready = Atomic.make false and stop = Atomic.make false in
+  let query = Domain.spawn (fun () ->
+      ignore (Unix.fstat alias);
+      Atomic.set ready true;
+      while not (Atomic.get stop) do ignore (Unix.fstat alias) done)
+  in
+  Fun.protect ~finally:(fun () -> Atomic.set stop true; Domain.join query) @@ fun () ->
+  while not (Atomic.get ready) do Domain.cpu_relax () done;
+  let source = Cstruct.of_string "x" and dest = Cstruct.create 1 in
+  let finish req =
+    let c = match Iocp.result req with Some c -> c | None -> status p in
+    assert (c.error = None && c.bytes_transferred = 1)
+  in
+  for _ = 1 to 1024 do
+    finish (Iocp.Event.write p ~data:2 w source ~offset:0L);
+    finish (Iocp.Event.read p ~data:1 r dest ~offset:0L);
+    assert (Cstruct.get_char dest 0 = 'x')
+  done
+
 let () =
   Alcotest.run "iocp"
     [
@@ -914,6 +976,9 @@ let () =
         List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
           [
+            ("event I/O during metadata queries", event_during_fstat);
+            ("event delivery", event_pipe ~skip_on_success:false);
+            ("immediate event delivery", event_pipe ~skip_on_success:true);
             ("file creation and append flags", open_flags);
             ("file creation permissions", creation_permissions);
             ("file delete sharing", delete_sharing);
@@ -944,7 +1009,8 @@ let () =
             ("targeted concurrent wait", concurrent_wait);
             ("sequential consumer handover", consumer_handover);
             ("retry unacknowledged delivery", retry_delivery);
-            ("shutdown preserves queued errors", shutdown_preserves_error);
+            ("shutdown preserves queued errors", shutdown_preserves_error ~event:false);
+            ("event shutdown preserves queued errors", shutdown_preserves_error ~event:true);
             ("buffered datagram truncation", buffered_truncation ~routed:false);
             ("cross-port datagram truncation", buffered_truncation ~routed:true);
             ("receive shutdown", receive_shutdown ~duplicate:false);

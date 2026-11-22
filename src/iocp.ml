@@ -47,12 +47,14 @@ and 'a handle = {
   pending : int Atomic.t; (* Negative once closed. *)
 }
 
+and 'a target = Registered of 'a handle | Event_fd of Unix.file_descr
+
 and 'a request = {
   operation : Raw.operation;
   id : int;
   data : 'a;
   owner : Raw.port;
-  handle : 'a handle;
+  target : 'a target;
   receive_key : file_key option;
   mutable eof_on_cancel : bool;
   mutable immediate : bool;
@@ -88,8 +90,10 @@ let check_handle t h =
   if Atomic.get h.pending < 0 then invalid_arg "Iocp: closed handle";
   if h.association.port_state != t then invalid_arg "Iocp: wrong port"
 
-let with_receives h receive fn =
-  if receive then Mutex.protect h.association.guard fn else fn ()
+let with_receives target receive fn =
+  match target with
+  | Registered h when receive -> Mutex.protect h.association.guard fn
+  | _ -> fn ()
 
 let file_key h = h.association.key
 let same_handle = Raw.same_handle
@@ -173,7 +177,13 @@ let check_timeout timeout =
 
 let untrack t r =
   Hashtbl.remove t.requests r.id;
-  Option.iter (Hashtbl.remove r.handle.association.receives) r.receive_key
+  match r.target, r.receive_key with
+  | Registered h, Some key -> Hashtbl.remove h.association.receives key
+  | _ -> ()
+
+let release_target = function
+  | Registered h -> Atomic.decr h.pending
+  | Event_fd _ -> ()
 
 let wait t ~timeout =
   check_timeout timeout;
@@ -207,67 +217,71 @@ let wait t ~timeout =
   | id ->
       locked t (fun () ->
           let r = Hashtbl.find t.requests id in
-          with_receives r.handle (Option.is_some r.receive_key) (fun () ->
+          with_receives r.target (Option.is_some r.receive_key) (fun () ->
               let result = Some (Completion (r.data, Raw.completion r.operation r.eof_on_cancel)) in
-          untrack t r;
-          Atomic.decr r.handle.pending;
-          Raw.acknowledge slot;
-          result))
+              untrack t r;
+              release_target r.target;
+              Raw.acknowledge slot;
+              result))
 
-let submit_pinned ~receive t ~data h roots fn =
-      let rec fresh_id () =
-        t.next_id <- if t.next_id = max_int then 1 else t.next_id + 1;
-        if Hashtbl.mem t.requests t.next_id then fresh_id () else t.next_id
+let submit_pinned ~receive t ~data target roots fn =
+  let rec fresh_id () =
+    t.next_id <- if t.next_id = max_int then 1 else t.next_id + 1;
+    if Hashtbl.mem t.requests t.next_id then fresh_id () else t.next_id
+  in
+  let id = fresh_id () in
+  let event_delivery () =
+    if t.skip_on_success then Raw.Forward_immediate else Raw.Forward_queue
+  in
+  let fd, delivery = match target with
+    | Event_fd fd -> fd, event_delivery ()
+    | Registered h when h.association.port_state != t -> h.fd, event_delivery ()
+    | Registered h ->
+      let skip = match h.association.skip with
+        | Some skip -> skip
+        | None ->
+          let skip = Raw.enable_immediate h.fd in
+          h.association.skip <- Some skip;
+          skip
       in
-      let id = fresh_id () in
-      let delivery =
-        if h.association.port_state != t then
-          (if t.skip_on_success then Raw.Forward_immediate else Raw.Forward_queue)
-        else
-          let skip = match h.association.skip with
-            | Some skip -> skip
-            | None ->
-                let skip = Raw.enable_immediate h.fd in
-                h.association.skip <- Some skip;
-                skip
-          in
-          if not skip then Raw.Native_queue
-          else if t.skip_on_success then Raw.Immediate
-          else Raw.Post_queue
-      in
-      let operation = Raw.allocate t.port id h.fd (h, roots) delivery in
-      let r =
-        {
-          operation;
-          id;
-          data;
-          owner = t.port;
-          handle = h;
-          receive_key = (if receive then Some (object end) else None);
-          eof_on_cancel = false;
-          immediate = false;
-        }
-      in
-      match
-        Option.iter (fun key -> Hashtbl.add h.association.receives key r) r.receive_key;
-        Hashtbl.add t.requests id r;
-        fn operation
-      with
-      | immediate ->
-          r.immediate <- immediate;
-          if immediate then untrack t r;
-          r
-      | exception ex ->
-          untrack t r;
-          raise ex
+      h.fd, (if not skip then Raw.Native_queue
+             else if t.skip_on_success then Raw.Immediate else Raw.Post_queue)
+  in
+  let operation = Raw.allocate t.port id fd (target, roots) delivery in
+  let r =
+    {
+      operation;
+      id;
+      data;
+      owner = t.port;
+      target;
+      receive_key = (if receive then Some (object end) else None);
+      eof_on_cancel = false;
+      immediate = false;
+    }
+  in
+  match
+    (match target, r.receive_key with
+     | Registered h, Some key -> Hashtbl.add h.association.receives key r
+     | _ -> ());
+    Hashtbl.add t.requests id r;
+    fn operation
+  with
+  | immediate ->
+      r.immediate <- immediate;
+      if immediate then untrack t r;
+      r
+  | exception ex ->
+      untrack t r;
+      raise ex
 
-let submit ?(receive = false) t ~data h roots fn =
+let submit ?(receive = false) t ~data target roots fn =
   locked t (fun () ->
       check t;
-      acquire h;
-      match with_receives h receive (fun () -> submit_pinned ~receive t ~data h roots fn) with
-      | r -> if r.immediate then Atomic.decr h.pending; r
-      | exception ex -> Atomic.decr h.pending; raise ex)
+      (match target with Registered h -> acquire h | Event_fd _ -> ());
+      match with_receives target receive (fun () -> submit_pinned ~receive t ~data target roots fn) with
+      | r -> if r.immediate then release_target target; r
+      | exception ex -> release_target target; raise ex)
 
 let result r = if r.immediate then Some (Raw.completion r.operation false) else None
 
@@ -279,18 +293,45 @@ let buffer kind t ~data fd buf ~offset =
     t ~data fd buf
     (fun op -> Raw.submit_buffer op kind buf offset)
 
-let read t = buffer Raw.Read_file t
-let write t = buffer Raw.Write_file t
-let recv t ~data fd buf = buffer Raw.Recv t ~data fd buf ~offset:0L
-let send t ~data fd buf = buffer Raw.Send t ~data fd buf ~offset:0L
-let recvfrom t ~data fd buf = buffer Raw.Recv_from t ~data fd buf ~offset:0L
-let sendto t ~data fd buf addr = buffer (Raw.Send_to addr) t ~data fd buf ~offset:0L
+module Operations (H : sig
+  type 'a t
+  val target : 'a t -> 'a target
+end) = struct
+  let read t ~data fd = buffer Raw.Read_file t ~data (H.target fd)
+  let write t ~data fd = buffer Raw.Write_file t ~data (H.target fd)
+  let recv t ~data fd buf = buffer Raw.Recv t ~data (H.target fd) buf ~offset:0L
+  let send t ~data fd buf = buffer Raw.Send t ~data (H.target fd) buf ~offset:0L
+  let recvfrom t ~data fd buf = buffer Raw.Recv_from t ~data (H.target fd) buf ~offset:0L
+  let sendto t ~data fd buf addr = buffer (Raw.Send_to addr) t ~data (H.target fd) buf ~offset:0L
 
-let accept t ~data fd ~client =
-  submit t ~data fd client (fun op -> Raw.submit_accept op client)
+  let accept t ~data fd ~client =
+    submit t ~data (H.target fd) client (fun op -> Raw.submit_accept op client)
 
-let connect t ~data fd addr =
-  submit t ~data fd addr (fun op -> Raw.submit_connect op addr)
+  let connect t ~data fd addr =
+    submit t ~data (H.target fd) addr (fun op -> Raw.submit_connect op addr)
+end
+
+include Operations (struct
+  type 'a t = 'a handle
+  let target h = Registered h
+end)
+
+module Event = struct
+  include Operations (struct
+    type 'a t = Unix.file_descr
+    let target fd = Event_fd fd
+  end)
+
+  let cancel_receives t fd =
+    locked t (fun () ->
+        check t;
+        Hashtbl.iter (fun _ r ->
+            match r.target, r.receive_key with
+            | Event_fd other, Some _ when fd == other || same_handle fd other ->
+              r.eof_on_cancel <- true;
+              Raw.cancel_operation r.operation
+            | _ -> ()) t.requests)
+end
 
 let openfile path flags perm =
   let has f = List.mem f flags in
