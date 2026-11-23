@@ -57,7 +57,7 @@ and 'a request = {
   target : 'a target;
   receive_key : file_key option;
   mutable eof_on_cancel : bool;
-  mutable immediate : bool;
+  mutable submission : Raw.submission;
 }
 
 let locked t fn = Mutex.protect t.lock fn
@@ -257,7 +257,7 @@ let submit_pinned ~receive t ~data target roots fn =
       target;
       receive_key = (if receive then Some (object end) else None);
       eof_on_cancel = false;
-      immediate = false;
+      submission = Queued;
     }
   in
   match
@@ -267,23 +267,39 @@ let submit_pinned ~receive t ~data target roots fn =
     Hashtbl.add t.requests id r;
     fn operation
   with
-  | immediate ->
-      r.immediate <- immediate;
-      if immediate then untrack t r;
+  | submission ->
+      r.submission <- submission;
+      if submission = Completed then untrack t r;
       r
   | exception ex ->
       untrack t r;
       raise ex
 
 let submit ?(receive = false) t ~data target roots fn =
-  locked t (fun () ->
+  let r = locked t (fun () ->
       check t;
       (match target with Registered h -> acquire h | Event_fd _ -> ());
       match with_receives target receive (fun () -> submit_pinned ~receive t ~data target roots fn) with
-      | r -> if r.immediate then release_target target; r
+      | r -> if r.submission = Completed then release_target target; r
       | exception ex -> release_target target; raise ex)
+  in
+  if r.submission = Unrouted then (
+    (* Cancellation may wait for the driver. Keep the request pinned while
+       letting other submissions and consumers use the port. *)
+    let release () =
+      locked t (fun () ->
+          with_receives target receive (fun () ->
+              untrack t r;
+              release_target target))
+    in
+    match Raw.drain_unrouted r.operation with
+    | submission ->
+        r.submission <- submission;
+        if submission = Completed then release ()
+    | exception ex -> release (); raise ex);
+  r
 
-let result r = if r.immediate then Some (Raw.completion r.operation false) else None
+let result r = if r.submission = Completed then Some (Raw.completion r.operation false) else None
 
 let buffer kind t ~data fd buf ~offset =
   if offset < 0L && not (kind = Raw.Write_file && offset = -1L) then

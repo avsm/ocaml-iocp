@@ -290,6 +290,34 @@ let shutdown_preserves_error ~event () =
       assert (c.source = Some (Unix.getsockname w)))
     [ false; true ]
 
+let unrouted_read () =
+  let port = Raw.create_port () in
+  Raw.close_port port;
+  let r, w = Iocp.pipe ~write_async:false () in
+  Fun.protect ~finally:(fun () -> Unix.close r; Unix.close w) @@ fun () ->
+  let buf = Cstruct.create 1 in
+  let read () =
+    let op = Raw.allocate port 1 r buf Raw.Forward_immediate in
+    assert (Raw.submit_buffer op Raw.Read_file buf 0L = Unrouted);
+    op
+  in
+  let cancelled = read () in
+  (match Raw.drain_unrouted cancelled with
+   | exception Unix.Unix_error _ -> ()
+   | _ -> Alcotest.fail "expected the routing error after cancellation");
+  let completed = read () in
+  ignore (Unix.write_substring w "xy" 0 2);
+  with_port (fun p ->
+      let marker = Cstruct.create 1 in
+      ignore (Iocp.Event.read p ~data:2 r marker ~offset:0L);
+      success p 2 1;
+      assert (Cstruct.get_char marker 0 = 'y'));
+  assert (Raw.drain_unrouted completed = Completed);
+  let result = Raw.completion completed false in
+  assert (result.error = None);
+  check "completed read" 1 result.bytes_transferred;
+  assert (Cstruct.get_char buf 0 = 'x')
+
 (* Model a failure while converting a dequeued packet, before delivery commits. *)
 let retry_delivery () =
   let slot = Raw.slot () in
@@ -977,6 +1005,7 @@ let () =
           (fun (n, f) -> Alcotest.test_case n `Quick f)
           [
             ("event I/O during metadata queries", event_during_fstat);
+            ("routing failure drains or preserves a completed read", unrouted_read);
             ("event delivery", event_pipe ~skip_on_success:false);
             ("immediate event delivery", event_pipe ~skip_on_success:true);
             ("file creation and append flags", open_flags);

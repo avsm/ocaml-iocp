@@ -209,7 +209,8 @@ val shutdown : 'a t -> 'a handle -> Unix.shutdown_command -> unit
     directly. Keep it open and unchanged until delivery, including after
     cancellation. Its completion-port association and notification modes are
     preserved. A pending operation signals a private event that delivers its
-    completion to the submitting port. *)
+    completion to the submitting port. If routing fails, the caller drains the
+    operation before returning or raising. Other threads can still use the port. *)
 module Event : sig
   val read : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> offset:int64 -> 'a request
 

@@ -51,13 +51,17 @@ type buffer_op =
   | Recv_from
   | Send_to of Unix.sockaddr
 
-external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> bool
+type submission = Queued | Completed | Unrouted
+
+external drain_unrouted : operation -> submission = "iocp_drain_unrouted"
+
+external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> submission
   = "iocp_submit_buffer"
 
-external submit_accept : operation -> Unix.file_descr -> bool
+external submit_accept : operation -> Unix.file_descr -> submission
   = "iocp_submit_accept"
 
-external submit_connect : operation -> Unix.sockaddr -> bool
+external submit_connect : operation -> Unix.sockaddr -> submission
   = "iocp_submit_connect"
 
 external cancel_operation : operation -> unit = "iocp_cancel"

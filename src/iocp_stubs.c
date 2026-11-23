@@ -311,27 +311,23 @@ static value completion(request *r, int eof_on_cancel) {
   Store_field(result, 2, source);
   CAMLreturn(result);
 }
+/* Matches Raw.submission. */
+enum submission { QUEUED, COMPLETED, UNROUTED };
+
 static value complete_immediately(request *r, DWORD bytes, DWORD err) {
   record_result(r, bytes, err);
   finish(r);
-  return Val_true;
+  return Val_int(COMPLETED);
 }
 
 static value submitted(request *r, DWORD err, const char *op) {
   if (r->event && err == ERROR_IO_PENDING) {
-    DWORD routing_error = route_pending(r, port(Field(r->roots, 1)));
-    if (!routing_error) return Val_false;
-    /* The kernel already owns the buffer. Drain cancellation before reporting
-       the routing error, preserving any result that won the race. */
-    caml_enter_blocking_section_no_pending();
-    CancelIoEx(r->fd, &r->overlapped);
-    WaitForSingleObject(r->event, INFINITE);
-    caml_leave_blocking_section();
-    if (r->packet) { CloseHandle(r->packet); r->packet = NULL; }
-    if (RtlNtStatusToDosError((NTSTATUS)r->overlapped.Internal) == ERROR_OPERATION_ABORTED)
-      err = routing_error;
-    else
-      err = ERROR_SUCCESS;
+    DWORD routing_error = route_pending(r, Port(Field(r->roots, 1)));
+    if (routing_error) {
+      r->error = routing_error;
+      return Val_int(UNROUTED);
+    }
+    return Val_int(QUEUED);
   }
   if (err != ERROR_SUCCESS && err != ERROR_IO_PENDING) {
     finish(r);
@@ -353,7 +349,24 @@ static value submitted(request *r, DWORD err, const char *op) {
       raise_win32(post_error, "PostQueuedCompletionStatus");
     }
   }
-  return Val_false;
+  return Val_int(QUEUED);
+}
+
+CAMLprim value iocp_drain_unrouted(value v) {
+  CAMLparam1(v);
+  request *r = Request(v);
+  DWORD routing_error = r->error;
+  r->error = 0;
+  caml_enter_blocking_section_no_pending();
+  CancelIoEx(r->fd, &r->overlapped);
+  WaitForSingleObject(r->event, INFINITE);
+  caml_leave_blocking_section();
+  if (r->packet) { CloseHandle(r->packet); r->packet = NULL; }
+  if (RtlNtStatusToDosError((NTSTATUS)r->overlapped.Internal) == ERROR_OPERATION_ABORTED) {
+    finish(r);
+    raise_win32(routing_error, "IOCP event delivery");
+  }
+  CAMLreturn(submitted(r, ERROR_SUCCESS, "overlapped_io"));
 }
 CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) {
   CAMLparam4(v, kind, buf, offset);
@@ -414,7 +427,7 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
     if (r->delivery == IMMEDIATE || r->delivery == FORWARD_IMMEDIATE)
       CAMLreturn(complete_immediately(r, 0, 0));
     if (PostQueuedCompletionStatus(port(Field(v, 1)), 0, 0, &r->overlapped))
-      CAMLreturn(Val_false);
+      CAMLreturn(Val_int(QUEUED));
     else
       err = GetLastError();
   }
