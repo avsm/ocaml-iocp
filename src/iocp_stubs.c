@@ -1,6 +1,7 @@
 /*
  * Copyright (C) 2020-2021 Anil Madhavapeddy
  * Copyright (C) 2020-2021 Sadiq Jaffer
+ * Copyright (C) 2026 Anil Madhavapeddy <anil@recoil.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -374,47 +375,6 @@ value ocaml_iocp_cancel(value v_fd, value v_overlapped) {
    DEALINGS IN THE SOFTWARE.
   ---------------------------------------------------------------------------*/
 
-// We need an openfile that passes FILE_FLAGS_OVERLAPPED -- the quickest way
-// was for me to copy the openfile from win32 in ocaml/ocaml... TODO: something
-// better ?
-
-/**************************************************************************/
-/*                                                                        */
-/*                                 OCaml                                  */
-/*                                                                        */
-/*   Xavier Leroy and Pascal Cuoq, projet Cristal, INRIA Rocquencourt     */
-/*                                                                        */
-/*   Copyright 1996 Institut National de Recherche en Informatique et     */
-/*     en Automatique.                                                    */
-/*                                                                        */
-/*   All rights reserved.  This file is distributed under the terms of    */
-/*   the GNU Lesser General Public License version 2.1, with the          */
-/*   special exception on linking described in the file LICENSE.          */
-/*                                                                        */
-/**************************************************************************/
-
-#include <windows.h>
-#include <fcntl.h>
-
-static int open_access_flags[15] = {
-  GENERIC_READ, GENERIC_WRITE, GENERIC_READ|GENERIC_WRITE,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-};
-
-static int open_create_flags[15] = {
-  0, 0, 0, 0, 0, O_CREAT, O_TRUNC, O_EXCL, 0, 0, 0, 0, 0, 0, 0
-};
-
-static int open_share_flags[15] = {
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, FILE_SHARE_DELETE, 0, 0
-};
-
-enum { CLOEXEC = 1, KEEPEXEC = 2 };
-
-static int open_cloexec_flags[15] = {
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CLOEXEC, KEEPEXEC
-};
-
 value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
 {
   CAMLparam4(v_iocp, v_id1, v_id2, v_path);
@@ -485,52 +445,64 @@ value ocaml_iocp_unix_pipe(value v_iocp, value v_id1, value v_id2, value v_path)
   CAMLreturn(res);
 }
 
-CAMLprim value ocaml_iocp_unix_open(value v_iocp, value v_id, value path, value flags, value perm)
-{
-  CAMLparam5(v_iocp, v_id, path, flags, perm);
-  int fileaccess, createflags, fileattrib, filecreate, sharemode, cloexec;
-  SECURITY_ATTRIBUTES attr;
-  HANDLE h;
-  char * wpath;
+CAMLextern value caml_win32_alloc_handle(HANDLE);
+CAMLextern void caml_win32_maperr(DWORD);
+CAMLextern void caml_unix_check_path(value, const char *);
+CAMLnoret CAMLextern void caml_uerror(const char *, value);
+static void raise_win32(DWORD err, const char *name) {
+  caml_win32_maperr(err);
+  caml_uerror(name, Nothing);
+}
 
-  HANDLE iocp = Handle_val(v_iocp);
+static DWORD file_access(value access, value append) {
+  DWORD rights = Int_val(access) == 0   ? GENERIC_READ
+                 : Int_val(access) == 1 ? GENERIC_WRITE
+                                        : GENERIC_READ | GENERIC_WRITE;
+  if (Bool_val(append) && Int_val(access) != 0)
+    rights = (rights & ~GENERIC_WRITE) | FILE_APPEND_DATA;
+  return rights;
+}
 
+static DWORD share_mode(value share_delete) {
+  return FILE_SHARE_READ | FILE_SHARE_WRITE | (Bool_val(share_delete) ? FILE_SHARE_DELETE : 0);
+}
+
+CAMLprim value iocp_reopen(value fd, value access, value append, value share_delete) {
+  CAMLparam4(fd, access, append, share_delete);
+  CAMLlocal1(result);
+  result = caml_win32_alloc_handle(INVALID_HANDLE_VALUE);
+  HANDLE original = Handle_val(fd);
+  DWORD rights = file_access(access, append);
+  DWORD sharing = share_mode(share_delete);
+  caml_enter_blocking_section();
+  HANDLE h = ReOpenFile(original, rights, sharing,
+                        FILE_FLAG_OVERLAPPED | FILE_FLAG_OPEN_REPARSE_POINT);
+  DWORD err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+  caml_leave_blocking_section();
+  if (err)
+    raise_win32(err, "ReOpenFile");
+  Handle_val(result) = h;
+  CAMLreturn(result);
+}
+
+CAMLprim value iocp_create_readonly(value path, value access, value append,
+                                   value share_delete, value creation) {
+  CAMLparam5(path, access, append, share_delete, creation);
+  CAMLlocal1(result);
+  result = caml_win32_alloc_handle(INVALID_HANDLE_VALUE);
   caml_unix_check_path(path, "open");
-  fileaccess = caml_convert_flag_list(flags, open_access_flags);
-  sharemode = FILE_SHARE_READ | FILE_SHARE_WRITE
-              | caml_convert_flag_list(flags, open_share_flags);
-
-  createflags = caml_convert_flag_list(flags, open_create_flags);
-  if ((createflags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
-    filecreate = CREATE_NEW;
-  else if ((createflags & (O_CREAT | O_TRUNC)) == (O_CREAT | O_TRUNC))
-    filecreate = CREATE_ALWAYS;
-  else if (createflags & O_TRUNC)
-    filecreate = TRUNCATE_EXISTING;
-  else if (createflags & O_CREAT)
-    filecreate = OPEN_ALWAYS;
-  else
-    filecreate = OPEN_EXISTING;
-
-  cloexec = caml_convert_flag_list(flags, open_cloexec_flags);
-  attr.nLength = sizeof(attr);
-  attr.lpSecurityDescriptor = NULL;
-  attr.bInheritHandle =
-    cloexec & CLOEXEC ? FALSE
-                      : cloexec & KEEPEXEC ? TRUE
-                                           : !unix_cloexec_default;
-
-  wpath = caml_stat_strdup(String_val(path));
-  h = CreateFile(wpath, fileaccess,
-                 sharemode, &attr,
-                 filecreate, FILE_FLAG_OVERLAPPED, NULL);
-  caml_stat_free(wpath);
-  if (h == INVALID_HANDLE_VALUE) {
-    win32_maperr(GetLastError());
-    uerror("open", path);
-  }
-
-  CreateIoCompletionPort(h, iocp, v_id, 0);
-
-  CAMLreturn(win_alloc_handle(h));
+  DWORD rights = file_access(access, append);
+  static const DWORD dispositions[] = {CREATE_NEW, CREATE_ALWAYS, OPEN_ALWAYS};
+  DWORD disposition = dispositions[Int_val(creation)], sharing = share_mode(share_delete);
+  wchar_t *name = caml_stat_strdup_to_utf16(String_val(path));
+  caml_enter_blocking_section_no_pending();
+  HANDLE h = CreateFileW(name, rights, sharing, NULL,
+                         disposition, FILE_ATTRIBUTE_READONLY | FILE_FLAG_OVERLAPPED, NULL);
+  DWORD err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+  caml_stat_free(name);
+  caml_leave_blocking_section();
+  if (err)
+    raise_win32(err, "CreateFileW");
+  Handle_val(result) = h;
+  CAMLreturn(result);
 }

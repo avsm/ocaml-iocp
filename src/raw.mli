@@ -6,10 +6,6 @@ val create_io_completion_port : int -> t
 external associate_fd_with_iocp : t -> Unix.file_descr -> id -> Handle.t
   = "ocaml_iocp_associate_fd_with_iocp"
 
-external openfile :
-  t -> id -> string -> Unix.open_flag list -> Unix.file_perm -> Handle.t
-  = "ocaml_iocp_unix_open"
-
 val pipe : t -> id -> id -> string -> Handle.t * Handle.t
 
 type completion_status = private
@@ -51,3 +47,16 @@ external write :
   = "ocaml_iocp_write_bytes" "ocaml_iocp_write"
 
 external cancel : Handle.t -> 'a Overlapped.t -> unit = "ocaml_iocp_cancel"
+
+type access = Read | Write | Read_write
+
+external reopen : Unix.file_descr -> access -> append:bool -> share_delete:bool -> Unix.file_descr
+  = "iocp_reopen"
+
+type disposition = Create_new | Create_always | Open_always
+
+external create_readonly :
+  string -> access -> append:bool -> share_delete:bool -> disposition -> Unix.file_descr
+  = "iocp_create_readonly"
+(** A later reopen for write access would be denied by the read-only attribute.
+*)

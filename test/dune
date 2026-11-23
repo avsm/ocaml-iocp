@@ -15,3 +15,8 @@
  (action
   (run ./copy.exe ./test.md ./test.out)))
 
+
+(test
+ (name test_iocp)
+ (modules test_iocp)
+ (libraries iocp alcotest))
