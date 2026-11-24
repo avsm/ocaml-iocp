@@ -197,8 +197,10 @@ val connect : 'a t -> data:'a -> 'a handle -> Unix.sockaddr -> 'a request
     its connection context. *)
 
 val shutdown : 'a t -> 'a handle -> Unix.shutdown_command -> unit
-(** Shut down a socket. Receive shutdown also cancels outstanding receives on
-    this port, including receives through duplicated descriptors. An aborted
+(** Shut down a socket on its registration port. Receive shutdown cancels
+    outstanding registered receives on every delivery port, including receives
+    through duplicated descriptors. For event-based receives, call
+    {!Event.cancel_receives} on each submitting port after shutdown. An aborted
     receive then completes successfully with zero bytes and no source address. A
     receive that already completed keeps its data or error. If a duplicated
     socket lacks its connection context, shutdown tries its other live
@@ -232,7 +234,8 @@ module Event : sig
   (** After shutting down receive on a socket, call this on each port that
       submitted event-based receives on it. This also covers duplicates.
       Aborted receives complete as end of input. Completed transfers and
-      errors keep their results. *)
+      errors keep their results. A closed port has no pending receives, so this
+      call has no effect. *)
 end
 
 (** {1 Descriptor constructors} *)

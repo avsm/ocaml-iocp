@@ -340,13 +340,23 @@ module Event = struct
 
   let cancel_receives t fd =
     locked t (fun () ->
-        check t;
-        Hashtbl.iter (fun _ r ->
-            match r.target, r.receive_key with
-            | Event_fd other, Some _ when fd == other || same_handle fd other ->
-              r.eof_on_cancel <- true;
-              Raw.cancel_operation r.operation
-            | _ -> ()) t.requests)
+        if Hashtbl.length t.requests <> 0 then (
+          let aliases = Hashtbl.create 8 in
+          let matches other =
+            fd == other ||
+            match Hashtbl.find_opt aliases other with
+            | Some same -> same
+            | None ->
+                let same = same_handle fd other in
+                Hashtbl.add aliases other same;
+                same
+          in
+          Hashtbl.iter (fun _ r ->
+              match r.target, r.receive_key with
+              | Event_fd other, Some _ when matches other ->
+                  r.eof_on_cancel <- true;
+                  Raw.cancel_operation r.operation
+              | _ -> ()) t.requests))
 end
 
 let openfile path flags perm =

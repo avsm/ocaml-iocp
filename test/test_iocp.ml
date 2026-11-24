@@ -233,7 +233,10 @@ let receive_shutdown ~duplicate () =
       close_fd other_b)
   @@ fun () ->
   with_port @@ fun p ->
-  ignore (Iocp.recv p ~data:1 (handle p a) (Cstruct.create 1));
+  with_port @@ fun remote ->
+  let h = handle p a in
+  ignore (Iocp.recv p ~data:1 h (Cstruct.create 1));
+  ignore (Iocp.recv remote ~data:3 h (Cstruct.create 1));
   let other = Iocp.recv p ~data:2 (handle p other_a) (Cstruct.create 1) in
   if duplicate then
     let alias = Unix.dup ~cloexec:true a in
@@ -249,12 +252,31 @@ let receive_shutdown ~duplicate () =
         (Printexc.to_string (Unix.Unix_error (e, "shutdown read", ""))));
   check "shutdown request" 1 data;
   check "EOF" 0 c.bytes_transferred;
+  success remote 3 0;
   assert (Iocp.wait p ~timeout:0 = None);
   check "unrelated receive remains pending" 1 (Iocp.pending p);
   Iocp.cancel p other;
   let data, c = delivery p in
   check "unrelated request" 2 data;
   assert (c.error <> None)
+
+let event_shutdown_aliases () =
+  let a, b = Unix.socketpair ~cloexec:true PF_UNIX SOCK_STREAM 0 in
+  let c, d = Unix.socketpair ~cloexec:true PF_UNIX SOCK_STREAM 0 in
+  let alias = Unix.dup ~cloexec:true a in
+  Fun.protect ~finally:(fun () -> List.iter Unix.close [a; b; c; d; alias]) @@ fun () ->
+  with_port @@ fun p ->
+  let closed = Iocp.create () in
+  Iocp.close closed;
+  Iocp.Event.cancel_receives closed alias;
+  let recv fd data = ignore (Iocp.Event.recv p ~data fd (Cstruct.create 1)) in
+  for _ = 1 to 2 do recv a 1; recv c 2 done;
+  Unix.shutdown a Unix.SHUTDOWN_RECEIVE;
+  Iocp.Event.cancel_receives p alias;
+  for _ = 1 to 2 do success p 1 0 done;
+  check "unrelated receives" 2 (Iocp.pending p);
+  ignore (Unix.write_substring d "xy" 0 2);
+  for _ = 1 to 2 do success p 2 1 done
 
 let shutdown_preserves_error ~event () =
   List.iter
@@ -1040,6 +1062,7 @@ let () =
             ("retry unacknowledged delivery", retry_delivery);
             ("shutdown preserves queued errors", shutdown_preserves_error ~event:false);
             ("event shutdown preserves queued errors", shutdown_preserves_error ~event:true);
+            ("event shutdown selects aliased receives", event_shutdown_aliases);
             ("buffered datagram truncation", buffered_truncation ~routed:false);
             ("cross-port datagram truncation", buffered_truncation ~routed:true);
             ("receive shutdown", receive_shutdown ~duplicate:false);
