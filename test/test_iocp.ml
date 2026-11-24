@@ -278,6 +278,31 @@ let event_shutdown_aliases () =
   ignore (Unix.write_substring d "xy" 0 2);
   for _ = 1 to 2 do success p 2 1 done
 
+let shutdown_after_cancel () =
+  let run ~all mode =
+    let r, w = Unix.socketpair ~cloexec:true PF_UNIX SOCK_STREAM 0 in
+    Fun.protect ~finally:(fun () -> close_fd r; close_fd w) @@ fun () ->
+    with_port @@ fun home ->
+    with_port @@ fun remote ->
+    let p = if mode = `Cross_port then remote else home in
+    let req = match mode with
+      | `Event -> Iocp.Event.recv p ~data:1 r (Cstruct.create 1)
+      | `Registered | `Cross_port -> Iocp.recv p ~data:1 (handle home r) (Cstruct.create 1)
+    in
+    if all then Iocp.cancel_all p else Iocp.cancel p req;
+    (* The cancelled receive has released the next byte. Its completion is still queued. *)
+    ignore (Unix.write_substring w "x" 0 1);
+    let marker = Bytes.create 1 in
+    assert (Unix.select [r] [] [] 2.0 <> ([], [], []));
+    assert (Unix.recv r marker 0 1 [] = 1 && Bytes.get marker 0 = 'x');
+    (match mode with
+     | `Event -> Unix.shutdown r Unix.SHUTDOWN_RECEIVE; Iocp.Event.cancel_receives p r
+     | `Registered | `Cross_port -> Iocp.shutdown home (handle home r) Unix.SHUTDOWN_RECEIVE);
+    let c = status p in
+    assert (Option.is_some c.error && c.bytes_transferred = 0)
+  in
+  List.iter (fun all -> List.iter (run ~all) [`Event; `Registered; `Cross_port]) [false; true]
+
 let shutdown_preserves_error ~event () =
   List.iter
     (fun skip_on_success ->
@@ -1063,6 +1088,7 @@ let () =
             ("shutdown preserves queued errors", shutdown_preserves_error ~event:false);
             ("event shutdown preserves queued errors", shutdown_preserves_error ~event:true);
             ("event shutdown selects aliased receives", event_shutdown_aliases);
+            ("shutdown preserves completed cancellation", shutdown_after_cancel);
             ("buffered datagram truncation", buffered_truncation ~routed:false);
             ("cross-port datagram truncation", buffered_truncation ~routed:true);
             ("receive shutdown", receive_shutdown ~duplicate:false);

@@ -16,6 +16,8 @@ type waiter = { slot : Raw.slot; mutable busy : bool }
 
 type file_key = < >
 
+type cancellation = Not_requested | Explicit | Receive_shutdown
+
 module Files = Map.Make (struct
   type t = file_key
   let compare = Stdlib.compare
@@ -56,7 +58,7 @@ and 'a request = {
   owner : Raw.port;
   target : 'a target;
   receive_key : file_key option;
-  mutable eof_on_cancel : bool;
+  mutable cancellation : cancellation;
   mutable submission : Raw.submission;
 }
 
@@ -158,18 +160,25 @@ let wake t =
       check t;
       Raw.wake_port t.port)
 
+let request_cancel reason r =
+  Raw.cancel_operation r.operation;
+  if r.cancellation = Not_requested then r.cancellation <- reason
+
+let explicit_cancel r =
+  with_receives r.target (Option.is_some r.receive_key) (fun () -> request_cancel Explicit r)
+
 let cancel t r =
   locked t (fun () ->
       check t;
       if r.owner != t.port then invalid_arg "Iocp.cancel: wrong port";
       match Hashtbl.find_opt t.requests r.id with
-      | Some current when current == r -> Raw.cancel_operation r.operation
+      | Some current when current == r -> explicit_cancel r
       | _ -> ())
 
 let cancel_all t =
   locked t (fun () ->
       check t;
-      Hashtbl.iter (fun _ r -> Raw.cancel_operation r.operation) t.requests)
+      Hashtbl.iter (fun _ r -> explicit_cancel r) t.requests)
 
 let check_timeout timeout =
   if timeout < -1 || Int64.of_int timeout > 0xffff_fffeL then
@@ -218,7 +227,7 @@ let wait t ~timeout =
       locked t (fun () ->
           let r = Hashtbl.find t.requests id in
           with_receives r.target (Option.is_some r.receive_key) (fun () ->
-              let result = Some (Completion (r.data, Raw.completion r.operation r.eof_on_cancel)) in
+              let result = Some (Completion (r.data, Raw.completion r.operation (r.cancellation = Receive_shutdown))) in
               untrack t r;
               release_target r.target;
               Raw.acknowledge slot;
@@ -256,7 +265,7 @@ let submit_pinned ~receive t ~data target roots fn =
       owner = t.port;
       target;
       receive_key = (if receive then Some (object end) else None);
-      eof_on_cancel = false;
+      cancellation = Not_requested;
       submission = Queued;
     }
   in
@@ -353,9 +362,7 @@ module Event = struct
           in
           Hashtbl.iter (fun _ r ->
               match r.target, r.receive_key with
-              | Event_fd other, Some _ when matches other ->
-                  r.eof_on_cancel <- true;
-                  Raw.cancel_operation r.operation
+              | Event_fd other, Some _ when matches other -> request_cancel Receive_shutdown r
               | _ -> ()) t.requests))
 end
 
@@ -422,11 +429,7 @@ let shutdown t h cmd =
              in
              retry h.association.handles);
           if cmd <> Unix.SHUTDOWN_SEND then
-            Hashtbl.iter
-              (fun _ r ->
-                r.eof_on_cancel <- true;
-                Raw.cancel_operation r.operation)
-              h.association.receives))
+            Hashtbl.iter (fun _ r -> request_cancel Receive_shutdown r) h.association.receives))
 
 module Shared = struct
   type 'a t = { raw : 'a; users : int Atomic.t; dispose : 'a -> unit }

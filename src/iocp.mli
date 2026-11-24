@@ -200,9 +200,10 @@ val shutdown : 'a t -> 'a handle -> Unix.shutdown_command -> unit
 (** Shut down a socket on its registration port. Receive shutdown cancels
     outstanding registered receives on every delivery port, including receives
     through duplicated descriptors. For event-based receives, call
-    {!Event.cancel_receives} on each submitting port after shutdown. An aborted
-    receive then completes successfully with zero bytes and no source address. A
-    receive that already completed keeps its data or error. If a duplicated
+    {!Event.cancel_receives} on each submitting port after shutdown. A receive
+    aborted by shutdown completes successfully with zero bytes and no source
+    address. An earlier explicit cancellation keeps its error. Completed
+    transfers and other errors keep their results. If a duplicated
     socket lacks its connection context, shutdown tries its other live
     registrations for the same kernel object. *)
 
@@ -233,8 +234,9 @@ module Event : sig
   val cancel_receives : 'a t -> Unix.file_descr -> unit
   (** After shutting down receive on a socket, call this on each port that
       submitted event-based receives on it. This also covers duplicates.
-      Aborted receives complete as end of input. Completed transfers and
-      errors keep their results. A closed port has no pending receives, so this
+      Receives aborted by shutdown complete as end of input. Earlier explicit
+      cancellations, completed transfers and other errors keep their results.
+      A closed port has no pending receives, so this
       call has no effect. *)
 end
 
