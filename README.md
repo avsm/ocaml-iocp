@@ -29,7 +29,7 @@ There is no fixed limit on the number of outstanding requests.
   operations reject resources that are still busy.
 - Use `Iocp.shutdown` for local socket receive shutdown: Windows does not reliably
   complete an outstanding receive when `Unix.shutdown` is used directly.
-  For event-based receives, call `Unix.shutdown` and then
+  For event-based receives, call `Iocp.Event.shutdown` and then
   `Iocp.Event.cancel_receives` on each submitting port.
 - Explicit cleanup is required. Abandoning a pending request retains its resources
   rather than allowing Windows to access memory reclaimed by the GC.

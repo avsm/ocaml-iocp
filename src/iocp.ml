@@ -347,6 +347,12 @@ module Event = struct
     let target fd = Event_fd fd
   end)
 
+  let shutdown fd cmd =
+    try Unix.shutdown fd cmd with Unix.Unix_error (ENOTCONN, _, _) ->
+      (* A duplicate made before ConnectEx may lack the connected socket context. *)
+      let current = Unix.dup ~cloexec:true fd in
+      Fun.protect ~finally:(fun () -> Unix.close current) (fun () -> Unix.shutdown current cmd)
+
   let cancel_receives t fd =
     locked t (fun () ->
         if Hashtbl.length t.requests <> 0 then (
@@ -417,17 +423,7 @@ let shutdown t h cmd =
   locked t (fun () ->
       Mutex.protect h.association.guard (fun () ->
           check_handle t h;
-          (try Unix.shutdown h.fd cmd
-           with Unix.Unix_error (ENOTCONN, _, _) as ex ->
-             (* A duplicated Winsock descriptor can lack the connection context. *)
-             let rec retry = function
-               | [] -> raise ex
-               | other :: rest when other.fd == h.fd -> retry rest
-               | other :: rest -> (
-                   try Unix.shutdown other.fd cmd
-                   with Unix.Unix_error (ENOTCONN, _, _) -> retry rest)
-             in
-             retry h.association.handles);
+          Event.shutdown h.fd cmd;
           if cmd <> Unix.SHUTDOWN_SEND then
             Hashtbl.iter (fun _ r -> request_cancel Receive_shutdown r) h.association.receives))
 

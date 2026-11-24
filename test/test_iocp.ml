@@ -303,6 +303,29 @@ let shutdown_after_cancel () =
   in
   List.iter (fun all -> List.iter (run ~all) [`Event; `Registered; `Cross_port]) [false; true]
 
+let shutdown_last_alias () =
+  let run event =
+    with_port @@ fun p ->
+    let listener = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+    Fun.protect ~finally:(fun () -> close_fd listener) @@ fun () ->
+    Unix.bind listener (ADDR_INET (Unix.inet_addr_loopback, 0));
+    Unix.listen listener 1;
+    let original = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
+    let alias = Unix.dup ~cloexec:true original in
+    Fun.protect ~finally:(fun () -> close_fd alias) @@ fun () ->
+    Fun.protect ~finally:(fun () -> close_fd original) (fun () ->
+        Unix.bind original (ADDR_INET (Unix.inet_addr_loopback, 0));
+        ignore (Iocp.connect p ~data:1 (handle p original) (Unix.getsockname listener));
+        success p 1 0);
+    let peer, _ = Unix.accept ~cloexec:true listener in
+    Fun.protect ~finally:(fun () -> Unix.close peer) @@ fun () ->
+    if event then Iocp.Event.shutdown alias Unix.SHUTDOWN_SEND
+    else Iocp.shutdown p (handle p alias) Unix.SHUTDOWN_SEND;
+    assert (Unix.select [peer] [] [] 2.0 <> ([], [], []));
+    check "peer EOF" 0 (Unix.recv peer (Bytes.create 1) 0 1 [])
+  in
+  List.iter run [false; true]
+
 let shutdown_preserves_error ~event () =
   List.iter
     (fun skip_on_success ->
@@ -1089,6 +1112,7 @@ let () =
             ("event shutdown preserves queued errors", shutdown_preserves_error ~event:true);
             ("event shutdown selects aliased receives", event_shutdown_aliases);
             ("shutdown preserves completed cancellation", shutdown_after_cancel);
+            ("shutdown on the last socket alias", shutdown_last_alias);
             ("buffered datagram truncation", buffered_truncation ~routed:false);
             ("cross-port datagram truncation", buffered_truncation ~routed:true);
             ("receive shutdown", receive_shutdown ~duplicate:false);

@@ -203,9 +203,7 @@ val shutdown : 'a t -> 'a handle -> Unix.shutdown_command -> unit
     {!Event.cancel_receives} on each submitting port after shutdown. A receive
     aborted by shutdown completes successfully with zero bytes and no source
     address. An earlier explicit cancellation keeps its error. Completed
-    transfers and other errors keep their results. If a duplicated
-    socket lacks its connection context, shutdown tries its other live
-    registrations for the same kernel object. *)
+    transfers and other errors keep their results. *)
 
 (** Per-request event delivery. These operations have the same arguments and
     results as the registered operations, but borrow an overlapped descriptor
@@ -230,6 +228,10 @@ module Event : sig
   val accept : 'a t -> data:'a -> Unix.file_descr -> client:Unix.file_descr -> 'a request
 
   val connect : 'a t -> data:'a -> Unix.file_descr -> Unix.sockaddr -> 'a request
+
+  val shutdown : Unix.file_descr -> Unix.shutdown_command -> unit
+  (** Shut down a socket, including a duplicate made before connection.
+      After receive shutdown, call {!cancel_receives} on each submitting port. *)
 
   val cancel_receives : 'a t -> Unix.file_descr -> unit
   (** After shutting down receive on a socket, call this on each port that
