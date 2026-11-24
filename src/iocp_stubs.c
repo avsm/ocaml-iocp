@@ -181,6 +181,7 @@ typedef struct {
   intnat id;
   value roots;
   int pending;
+  DWORD length;
   DWORD bytes;
   enum delivery delivery;
   DWORD error;
@@ -261,17 +262,17 @@ static void finish(request *r) {
   r->pending = 0;
   caml_remove_generational_global_root(&r->roots);
 }
+static int eof_error(request *r, DWORD err) {
+  return (r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) ||
+         (r->kind == OP_RECV && err == WSAESHUTDOWN);
+}
+
 static void record_result(request *r, DWORD bytes, DWORD err) {
   if (!err) err = r->error;
-  if (err && r->kind >= OP_RECV) {
+  if (err && r->kind >= OP_RECV && !eof_error(r, err)) {
     DWORD flags = 0;
     if (!WSAGetOverlappedResult((SOCKET)r->fd, &r->overlapped, &bytes, FALSE, &flags))
       err = WSAGetLastError();
-  }
-  if ((r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) ||
-      (r->kind == OP_RECV && err == WSAESHUTDOWN)) {
-    err = 0;
-    bytes = 0;
   }
   if (!err && r->kind == OP_ACCEPT) {
     SOCKET listener = (SOCKET)r->fd;
@@ -290,7 +291,9 @@ static value completion(request *r, int eof_on_cancel) {
   CAMLparam0();
   CAMLlocal4(result, error, code, source);
   DWORD err = r->error, bytes = r->bytes;
-  if (eof_on_cancel && err == ERROR_OPERATION_ABORTED) {
+  int eof = eof_error(r, err) || (eof_on_cancel && err == ERROR_OPERATION_ABORTED) ||
+            (!err && !bytes && r->kind == OP_RECV && r->length != 0);
+  if (eof) {
     err = 0;
     bytes = 0;
   }
@@ -305,10 +308,11 @@ static value completion(request *r, int eof_on_cancel) {
     code = caml_unix_error_of_code(errno);
     error = caml_alloc_some(code);
   }
-  result = caml_alloc_tuple(3);
+  result = caml_alloc_tuple(4);
   Store_field(result, 0, Val_long(bytes));
   Store_field(result, 1, error);
   Store_field(result, 2, source);
+  Store_field(result, 3, Val_bool(eof));
   CAMLreturn(result);
 }
 /* Matches Raw.submission. */
@@ -381,6 +385,7 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
   r->overlapped.Offset = (DWORD)off;
   r->overlapped.OffsetHigh = (DWORD)(off >> 32);
   r->kind = Is_block(kind) ? OP_SENDTO : Int_val(kind);
+  r->length = (DWORD)len;
   if (r->kind == OP_RECVFROM)
     r->address_len = sizeof(r->addresses.connect);
   if (r->kind == OP_SENDTO) {
@@ -393,8 +398,11 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
   start(v);
   switch (r->kind) {
   case OP_READ:
-    if (!ReadFile(r->fd, data, (DWORD)len, NULL, &r->overlapped))
+    if (!ReadFile(r->fd, data, (DWORD)len, NULL, &r->overlapped)) {
       err = GetLastError();
+      /* A partial message read signals completion with the copied byte count. */
+      if (err == ERROR_MORE_DATA) err = ERROR_IO_PENDING;
+    }
     break;
   case OP_WRITE:
     if (!WriteFile(r->fd, data, (DWORD)len, NULL, &r->overlapped))
@@ -422,10 +430,10 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
     finish(r);
     caml_invalid_argument("Iocp: invalid buffer operation");
   }
-  if ((r->kind == OP_READ && (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE)) ||
-      (r->kind == OP_RECV && err == WSAESHUTDOWN)) {
+  if (eof_error(r, err)) {
+    r->error = err;
     if (r->delivery == IMMEDIATE || r->delivery == FORWARD_IMMEDIATE)
-      CAMLreturn(complete_immediately(r, 0, 0));
+      CAMLreturn(complete_immediately(r, 0, err));
     if (PostQueuedCompletionStatus(port(Field(v, 1)), 0, 0, &r->overlapped))
       CAMLreturn(Val_int(QUEUED));
     else

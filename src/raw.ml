@@ -19,6 +19,7 @@ type completion = {
   bytes_transferred : int;
   error : Unix.error option;
   source : Unix.sockaddr option;
+  eof : bool;
 }
 
 type slot = (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t

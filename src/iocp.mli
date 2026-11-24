@@ -70,6 +70,9 @@ type completion = {
       (** Is [None] on success or [Some e] on failure. *)
   source : Unix.sockaddr option;
       (** Gives the sender on successful datagram reception. *)
+  eof : bool;
+      (** Is true at end of input. An empty pipe message returned by {!read}
+          or an empty datagram returned by {!recvfrom} leaves this field false. *)
 }
 (** Describes a completed operation. *)
 
@@ -163,7 +166,8 @@ val cancel_all : 'a t -> unit
 val read : 'a t -> data:'a -> 'a handle -> Cstruct.t -> offset:int64 -> 'a request
 (** Read into the buffer at the given file offset. Use a non-negative offset for
     files and [0L] for pipes. End of input completes successfully with zero
-    bytes. *)
+    bytes. A partial message-mode pipe read reports the copied byte count and
+    the Windows [ERROR_MORE_DATA] error. The next read continues the message. *)
 
 val write : 'a t -> data:'a -> 'a handle -> Cstruct.t -> offset:int64 -> 'a request
 (** Write from the buffer at the given file offset. Use a non-negative offset

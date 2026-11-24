@@ -86,7 +86,9 @@ let file () =
   (* A truncated high offset would read the five bytes at offset 8. *)
   for id = 3 to 102 do
     ignore (Iocp.read p ~data:id (handle p fd) buf ~offset:0x1_0000_0008L);
-    success p id 0;
+    let received, c = delivery p in
+    check "id" id received;
+    assert (c.eof && c.bytes_transferred = 0 && c.error = None);
     assert (Iocp.wait p ~timeout:0 = None)
   done;
   check "no pending" 0 (Iocp.pending p)
@@ -102,6 +104,54 @@ let pipe () =
   check "read/write bytes" 10 (a.bytes_transferred + b.bytes_transferred);
   assert (a.error = None && b.error = None);
   Alcotest.(check string) "contents" "hello" (Cstruct.to_string buf)
+
+let partial_message_read () =
+  let run mode skip_on_success =
+    let r, w = Iocp.pipe ~write_async:false ~message:true () in
+    Fun.protect ~finally:(fun () -> close_fd r; close_fd w) @@ fun () ->
+    with_port @@ fun home ->
+    with_port ~skip_on_success @@ fun p ->
+    let read = match mode with
+      | `Event -> Iocp.Event.read p ~data:1 r
+      | `Registered -> Iocp.read p ~data:1 (handle p r)
+      | `Cross_port -> Iocp.read p ~data:1 (handle home r)
+    in
+    let finish req = match Iocp.result req with Some c -> c | None -> status p in
+    let write () = check "message length" 5 (Unix.write_substring w "hello" 0 5) in
+    List.iter (fun prefilled ->
+        if prefilled then write ();
+        let buf = Cstruct.create 2 in
+        let req = read buf ~offset:0L in
+        if not prefilled then write ();
+        let c = finish req in
+        assert (Option.is_some c.error && not c.eof);
+        check "partial count" 2 c.bytes_transferred;
+        Alcotest.(check string) "prefix" "he" (Cstruct.to_string buf);
+        let buf = Cstruct.create 3 in
+        let c = finish (read buf ~offset:0L) in
+        assert (c.error = None);
+        check "remaining count" 3 c.bytes_transferred;
+        Alcotest.(check string) "suffix" "llo" (Cstruct.to_string buf);
+        assert (Iocp.wait p ~timeout:0 = None && Iocp.wait home ~timeout:0 = None))
+      [true; false]
+  in
+  List.iter (fun mode -> List.iter (run mode) [false; true]) [`Event; `Registered; `Cross_port]
+
+let empty_message () =
+  let run skip_on_success =
+    with_port ~skip_on_success @@ fun p ->
+    let r, w = Iocp.pipe ~message:true () in
+    Fun.protect ~finally:(fun () -> close_fd r) @@ fun () ->
+    let finish req = match Iocp.result req with Some c -> c | None -> status p in
+    Fun.protect ~finally:(fun () -> close_fd w) (fun () ->
+        let c = finish (Iocp.Event.write p ~data:1 w (Cstruct.create 0) ~offset:0L) in
+        assert (c.error = None && not c.eof));
+    List.iter (fun eof ->
+        let c = finish (Iocp.Event.read p ~data:2 r (Cstruct.create 1) ~offset:0L) in
+        assert (c.error = None && c.bytes_transferred = 0);
+        Alcotest.(check bool) "end of input" eof c.eof) [false; true]
+  in
+  List.iter run [false; true]
 
 let cancel_gc () =
   with_pipe @@ fun p r _w ->
@@ -199,7 +249,11 @@ let sockets ~routed () =
   let a = status p and b = status p in
   assert (a.error = None && b.error = None);
   check "bytes" 10 (a.bytes_transferred + b.bytes_transferred);
-  Alcotest.(check string) "socket contents" "hello" (Cstruct.to_string buf)
+  Alcotest.(check string) "socket contents" "hello" (Cstruct.to_string buf);
+  Iocp.Event.shutdown client Unix.SHUTDOWN_SEND;
+  ignore (Iocp.recv p ~data:5 (handle home accepted) buf);
+  let c = status p in
+  assert (c.eof && c.error = None && c.bytes_transferred = 0)
 
 let refused () =
   let reserved = Unix.socket ~cloexec:true PF_INET SOCK_STREAM 0 in
@@ -252,6 +306,7 @@ let receive_shutdown ~duplicate () =
         (Printexc.to_string (Unix.Unix_error (e, "shutdown read", ""))));
   check "shutdown request" 1 data;
   check "EOF" 0 c.bytes_transferred;
+  assert c.eof;
   success remote 3 0;
   assert (Iocp.wait p ~timeout:0 = None);
   check "unrelated receive remains pending" 1 (Iocp.pending p);
@@ -579,7 +634,7 @@ let datagrams () =
       assert (x.error = None && y.error = None);
       let received = if id = 2 then x else y in
       check "datagram length" (String.length msg) received.bytes_transferred;
-      assert (received.source = Some (Unix.getsockname b));
+      assert (received.source = Some (Unix.getsockname b) && not received.eof);
       Alcotest.(check string)
         "datagram contents" msg
         (Cstruct.to_string (Cstruct.sub buf 0 received.bytes_transferred)))
@@ -1097,6 +1152,8 @@ let () =
             ("datagrams and cancellation", datagrams);
             ("cancel blocked pipe write", cancel_write);
             ("pipe EOF", pipe_eof);
+            ("partial message-mode pipe reads", partial_message_read);
+            ("empty pipe message before end of input", empty_message);
             ("append preserves access", append_access);
             ("cancel accept", cancel_accept);
             ("cancellation race", cancel_race);

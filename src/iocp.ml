@@ -8,6 +8,7 @@ type completion = Raw.completion = {
   bytes_transferred : int;
   error : Unix.error option;
   source : Unix.sockaddr option;
+  eof : bool;
 }
 
 type 'a event = Wake | Completion of 'a * completion
