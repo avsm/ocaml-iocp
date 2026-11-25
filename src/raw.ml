@@ -59,6 +59,8 @@ external drain_unrouted : operation -> submission = "iocp_drain_unrouted"
 external submit_buffer : operation -> buffer_op -> Cstruct.t -> int64 -> submission
   = "iocp_submit_buffer"
 
+external submit_notify : operation -> Cstruct.buffer -> bool -> submission = "iocp_submit_notify"
+
 external submit_accept : operation -> Unix.file_descr -> submission
   = "iocp_submit_accept"
 

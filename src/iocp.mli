@@ -217,6 +217,11 @@ val shutdown : 'a t -> 'a handle -> Unix.shutdown_command -> unit
     completion to the submitting port. If routing fails, the caller drains the
     operation before returning or raising. Other threads can still use the port. *)
 module Event : sig
+  val notify : 'a t -> data:'a -> Unix.file_descr -> recursive:bool -> Cstruct.buffer -> 'a request
+  (** Monitor an overlapped directory handle for entry and file changes. Supply a
+      DWORD-aligned buffer of 16 to 65536 bytes. A successful zero-byte result
+      requests a directory rescan. Keep the buffer untouched until completion. *)
+
   val read : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> offset:int64 -> 'a request
 
   val write : 'a t -> data:'a -> Unix.file_descr -> Cstruct.t -> offset:int64 -> 'a request

@@ -1122,6 +1122,26 @@ let event_during_fstat () =
     assert (Cstruct.get_char dest 0 = 'x')
   done
 
+let notify_submission () =
+  List.iter (fun skip_on_success ->
+      with_pipe ~skip_on_success @@ fun port fd _ ->
+      let notify buf = Iocp.Event.notify port ~data:0 fd ~recursive:false buf in
+      let buf = (Cstruct.create 64).buffer in
+      let bad buf =
+        match notify buf with
+        | exception Invalid_argument _ -> ()
+        | _ -> Alcotest.fail "invalid notification buffer accepted"
+      in
+      bad (Bigarray.Array1.sub buf 0 12);
+      bad (Bigarray.Array1.sub buf 1 32);
+      (match notify buf with
+       | exception Unix.Unix_error _ -> ()
+       | req ->
+         let c = match Iocp.result req with Some c -> c | None -> status port in
+         if c.error = None then Alcotest.fail "directory notification on a pipe succeeded");
+      check "pending after failed submission" 0 (Iocp.pending port)
+    ) [false; true]
+
 let () =
   Alcotest.run "iocp"
     [
@@ -1185,5 +1205,6 @@ let () =
             ("accept/connect/send/recv", sockets ~routed:false);
             ("cross-port TCP", sockets ~routed:true);
             ("connection refusal", refused);
+            ("directory notification submission errors", notify_submission);
           ] );
     ]

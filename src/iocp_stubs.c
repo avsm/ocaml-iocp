@@ -170,7 +170,7 @@ CAMLprim value iocp_wake(value v) {
 enum delivery { NATIVE_QUEUE, POST_QUEUE, IMMEDIATE, FORWARD_QUEUE, FORWARD_IMMEDIATE };
 
 /* Constant constructors of Raw.buffer_op come first, in declaration order. */
-enum operation_kind { OP_READ, OP_WRITE, OP_RECV, OP_SEND, OP_RECVFROM, OP_SENDTO, OP_ACCEPT, OP_CONNECT };
+enum operation_kind { OP_READ, OP_WRITE, OP_RECV, OP_SEND, OP_RECVFROM, OP_SENDTO, OP_ACCEPT, OP_CONNECT, OP_NOTIFY };
 
 typedef struct {
   OVERLAPPED overlapped; /* Must be first: completion packets return this address. */
@@ -268,8 +268,12 @@ static int eof_error(request *r, DWORD err) {
 }
 
 static void record_result(request *r, DWORD bytes, DWORD err) {
+  if (r->kind == OP_NOTIFY && err == ERROR_NOTIFY_ENUM_DIR) {
+    err = 0;
+    bytes = 0;
+  }
   if (!err) err = r->error;
-  if (err && r->kind >= OP_RECV && !eof_error(r, err)) {
+  if (err && (r->kind >= OP_RECV && r->kind <= OP_CONNECT) && !eof_error(r, err)) {
     DWORD flags = 0;
     if (!WSAGetOverlappedResult((SOCKET)r->fd, &r->overlapped, &bytes, FALSE, &flags))
       err = WSAGetLastError();
@@ -339,7 +343,7 @@ static value submitted(request *r, DWORD err, const char *op) {
   }
   if (!err && r->delivery != NATIVE_QUEUE) {
     DWORD bytes = 0, flags = 0;
-    if (r->kind >= OP_RECV) {
+    if (r->kind >= OP_RECV && r->kind <= OP_CONNECT) {
       if (!WSAGetOverlappedResult((SOCKET)r->fd, &r->overlapped, &bytes, FALSE, &flags))
         err = WSAGetLastError();
     } else if (!GetOverlappedResult(r->fd, &r->overlapped, &bytes, FALSE))
@@ -441,6 +445,33 @@ CAMLprim value iocp_submit_buffer(value v, value kind, value buf, value offset) 
   }
   CAMLreturn(submitted(r, err, "overlapped_io"));
 }
+/* ReadDirectoryChangesW reports successful queueing even for a pending request.
+   The private event supplies the completion in both cases. */
+CAMLprim value iocp_submit_notify(value v, value buf, value recursive) {
+  CAMLparam3(v, buf, recursive);
+  request *r = Request(v);
+  intnat length = Caml_ba_array_val(buf)->dim[0];
+  void *data = Caml_ba_data_val(buf);
+  if (length < 16 || length > 65536 || ((uintptr_t)data & 3))
+    caml_invalid_argument("Iocp.Event.notify: invalid notification buffer");
+  r->kind = OP_NOTIFY;
+  start(v);
+  DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                 FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
+  if (ReadDirectoryChangesW(r->fd, data, (DWORD)length, Bool_val(recursive), filter,
+                            NULL, &r->overlapped, NULL))
+    CAMLreturn(submitted(r, ERROR_IO_PENDING, "ReadDirectoryChangesW"));
+  DWORD error = GetLastError();
+  if (error == ERROR_NOTIFY_ENUM_DIR) {
+    /* No request was queued. Use the event submission's normal delivery mode. */
+    if (r->delivery == FORWARD_IMMEDIATE) CAMLreturn(complete_immediately(r, 0, 0));
+    if (PostQueuedCompletionStatus(port(Field(v, 1)), 0, 0, &r->overlapped))
+      CAMLreturn(Val_int(QUEUED));
+    error = GetLastError();
+  }
+  CAMLreturn(submitted(r, error, "ReadDirectoryChangesW"));
+}
+
 CAMLprim value iocp_submit_accept(value v, value client) {
   CAMLparam2(v, client);
   request *r = Request(v);

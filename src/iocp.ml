@@ -348,6 +348,9 @@ module Event = struct
     let target fd = Event_fd fd
   end)
 
+  let notify t ~data fd ~recursive buf =
+    submit t ~data (Event_fd fd) buf (fun op -> Raw.submit_notify op buf recursive)
+
   let shutdown fd cmd =
     try Unix.shutdown fd cmd with Unix.Unix_error (ENOTCONN, _, _) ->
       (* A duplicate made before ConnectEx may lack the connected socket context. *)
